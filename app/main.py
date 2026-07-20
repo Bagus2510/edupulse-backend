@@ -1,8 +1,9 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.core.config import settings
 from app.core.database import check_db_connection
-from app.routers import superset, airflow, ai, settings, dashboards, activity, pipeline
+from app.routers import superset, airflow, ai, settings as settings_router, dashboards, activity, pipeline, auth
 
 app = FastAPI(
     title="EduPulse Backend",
@@ -12,7 +13,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:3001"],
+    allow_origins=[origin.strip() for origin in settings.CORS_ORIGINS.split(",")],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -21,10 +22,11 @@ app.add_middleware(
 app.include_router(superset.router)
 app.include_router(airflow.router)
 app.include_router(ai.router)
-app.include_router(settings.router)
+app.include_router(settings_router.router)
 app.include_router(dashboards.router)
 app.include_router(activity.router)
 app.include_router(pipeline.router)
+app.include_router(auth.router)
 
 
 @app.get("/api/health")
