@@ -29,6 +29,7 @@ class DAGStatusResponse(BaseModel):
 class AnalyzeRequest(BaseModel):
     dashboard_title: str
     dashboard_description: str
+    dashboard_uuid: str = ""
 
 
 class AnalyzeResponse(BaseModel):
@@ -39,6 +40,23 @@ class AnalyzeResponse(BaseModel):
     business_recommendation: str
     potential_issue: str | None
     confidence: float
+
+
+# AI Chat
+class ChatRequest(BaseModel):
+    message: str
+    dashboard_uuid: str
+    session_id: str
+    dashboard_title: str = ""
+
+
+class ChatResponse(BaseModel):
+    response: str
+    session_id: str
+
+
+class ChatClearRequest(BaseModel):
+    session_id: str
 
 
 # Dashboards
@@ -89,3 +107,61 @@ class PipelineRunResponse(BaseModel):
 
 class PipelineTriggerRequest(BaseModel):
     dag_id: str
+
+
+# Pipeline Builder
+class PipelineStepCreate(BaseModel):
+    name: str
+    source_table: str = ""
+    query: str
+    query_type: str = "sql"
+    dest_table: str = ""
+
+
+class PipelineStepResponse(BaseModel):
+    id: int
+    pipeline_id: int
+    step_order: int
+    name: str
+    source_table: str | None
+    query: str
+    query_type: str
+    dest_table: str | None
+
+
+class PipelineCreate(BaseModel):
+    name: str
+    description: str = ""
+    steps: list[PipelineStepCreate] = []
+
+
+class PipelineResponse(BaseModel):
+    id: int
+    name: str
+    description: str | None
+    status: str
+    last_run_at: str | None
+    steps: list[PipelineStepResponse] = []
+    created_at: str
+    updated_at: str
+
+
+class PipelineListResponse(BaseModel):
+    id: int
+    name: str
+    description: str | None
+    status: str
+    last_run_at: str | None
+    step_count: int
+    created_at: str
+
+
+class TableInfo(BaseModel):
+    schema_name: str
+    table_name: str
+    full_name: str
+
+
+class ColumnInfo(BaseModel):
+    column_name: str
+    data_type: str

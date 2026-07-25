@@ -61,6 +61,18 @@ async def create_dashboard(payload: DashboardCreate, db: AsyncSession = Depends(
     return {"message": "Dashboard created"}
 
 
+@router.put("/{dashboard_id}")
+async def update_dashboard(dashboard_id: int, payload: DashboardCreate, db: AsyncSession = Depends(get_db)):
+    await db.execute(
+        text(
+            "UPDATE app.dashboards SET title = :t, description = :d, superset_uuid = :u, status = :s, updated_at = NOW() WHERE id = :id"
+        ),
+        {"t": payload.title, "d": payload.description, "u": payload.superset_uuid, "s": payload.status, "id": dashboard_id},
+    )
+    await db.commit()
+    return {"message": "Dashboard updated"}
+
+
 @router.delete("/{dashboard_id}")
 async def delete_dashboard(dashboard_id: int, db: AsyncSession = Depends(get_db)):
     await db.execute(
