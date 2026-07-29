@@ -65,7 +65,10 @@ async def create_pipeline(
 
 
 @router.get("/tables", response_model=list[TableInfo])
-async def list_tables(db: AsyncSession = Depends(get_db)):
+async def list_tables(
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
     result = await db.execute(
         text("SELECT table_schema, table_name FROM information_schema.tables WHERE table_schema IN ('raw', 'mart') ORDER BY table_schema, table_name")
     )
@@ -77,7 +80,12 @@ async def list_tables(db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/tables/{schema_name}.{table_name}/columns", response_model=list[ColumnInfo])
-async def list_columns(schema_name: str, table_name: str, db: AsyncSession = Depends(get_db)):
+async def list_columns(
+    schema_name: str,
+    table_name: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
     result = await db.execute(
         text("SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = :s AND table_name = :t ORDER BY ordinal_position"),
         {"s": schema_name, "t": table_name},

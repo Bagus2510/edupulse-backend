@@ -1,7 +1,10 @@
 from fastapi import APIRouter, HTTPException
+import logging
 
 from app.models.schemas import GuestTokenRequest, GuestTokenResponse
 from app.services.superset_client import get_guest_token
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/api/superset",
@@ -18,4 +21,5 @@ async def guest_token(req: GuestTokenRequest):
             dashboard_uuid=req.dashboard_uuid,
         )
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Superset error: {e}")
+        logger.error("Superset guest token error: %s", e)
+        raise HTTPException(status_code=502, detail="Gagal menghubungi Superset")

@@ -53,7 +53,12 @@ async def get_current_user(
     user_id = payload.get("sub")
     if user_id is None:
         raise HTTPException(status_code=401, detail="Token tidak valid")
-    result = await db.execute(select("*").select_from(text("app.users")).where(text("id = :id").bindparams(id=int(user_id))))
+    result = await db.execute(
+        select(
+            text("id"), text("email"), text("full_name"),
+            text("role"), text("avatar_initial"), text("is_active"),
+        ).select_from(text("app.users")).where(text("id = :id").bindparams(id=int(user_id)))
+    )
     user = result.mappings().first()
     if not user or not user["is_active"]:
         raise HTTPException(status_code=401, detail="User tidak ditemukan")

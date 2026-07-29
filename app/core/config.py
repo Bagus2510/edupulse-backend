@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     AIRFLOW_USERNAME: str = "airflow"
     AIRFLOW_PASSWORD: str = "airflow"
 
+    # FastAPI
+    FASTAPI_URL: str = "http://localhost:8000"
+
     # Gemini
     GEMINI_API_KEY: str = ""
     GEMINI_MODEL: str = "gemini-2.5-flash"

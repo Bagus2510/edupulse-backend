@@ -40,7 +40,8 @@ async def analyze(req: AnalyzeRequest):
         )
         return AnalyzeResponse(**result)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Gemini error: {e}")
+        logger.error("Gemini analyze error: %s", e)
+        raise HTTPException(status_code=502, detail="Gagal memproses analisis AI")
 
 
 @router.post("/chat", response_model=ChatResponse)
@@ -55,7 +56,7 @@ async def chat_endpoint(req: ChatRequest):
         return ChatResponse(response=response, session_id=req.session_id)
     except Exception as e:
         logger.error("Chat error: %s", e)
-        raise HTTPException(status_code=502, detail=f"Gemini error: {e}")
+        raise HTTPException(status_code=502, detail="Gagal memproses chat AI")
 
 
 @router.post("/chat/clear")
