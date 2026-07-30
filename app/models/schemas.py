@@ -160,6 +160,8 @@ class TableInfo(BaseModel):
     schema_name: str
     table_name: str
     full_name: str
+    row_count: int = 0
+    column_count: int = 0
 
 
 class ColumnInfo(BaseModel):

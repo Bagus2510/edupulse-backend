@@ -1,3 +1,4 @@
+import logging
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -17,6 +18,9 @@ from app.models.schemas import (
 )
 from app.services.dag_generator import generate_dag, delete_dag_file
 from app.services.airflow_client import trigger_dag, get_dag_status
+from app.services.pipeline_validator import validate_step
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/pipelines", tags=["pipelines"])
 
@@ -27,6 +31,27 @@ async def list_pipelines(db: AsyncSession = Depends(get_db)):
         text("SELECT p.*, (SELECT COUNT(*) FROM app.pipeline_steps WHERE pipeline_id = p.id) AS step_count FROM app.pipelines p ORDER BY p.created_at DESC")
     )
     rows = result.fetchall()
+
+    for r in rows:
+        if r.status == "running":
+            try:
+                airflow_result = await get_dag_status(f"pipeline_{r.id}")
+                airflow_state = airflow_result.get("state")
+                if airflow_state and airflow_state in ("success", "failed"):
+                    await db.execute(
+                        text("UPDATE app.pipeline_runs SET status = :s WHERE dag_id = :d AND status = 'running'"),
+                        {"s": airflow_state, "d": f"pipeline_{r.id}"},
+                    )
+                    await db.execute(
+                        text("UPDATE app.pipelines SET status = :s WHERE id = :id"),
+                        {"s": airflow_state, "id": r.id},
+                    )
+                    r.status = airflow_state
+            except Exception:
+                pass
+
+    await db.commit()
+
     return [
         PipelineListResponse(
             id=r.id,
@@ -47,6 +72,11 @@ async def create_pipeline(
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    for i, step in enumerate(payload.steps, 1):
+        err = validate_step(step.model_dump())
+        if err:
+            raise HTTPException(status_code=400, detail=f"Step {i} ({step.name}): {err}")
+
     result = await db.execute(
         text("INSERT INTO app.pipelines (name, description, created_by) VALUES (:n, :d, :u) RETURNING id"),
         {"n": payload.name, "d": payload.description, "u": current_user["id"]},
@@ -106,6 +136,11 @@ async def update_pipeline(
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    for i, step in enumerate(payload.steps, 1):
+        err = validate_step(step.model_dump())
+        if err:
+            raise HTTPException(status_code=400, detail=f"Step {i} ({step.name}): {err}")
+
     existing = await db.execute(text("SELECT id FROM app.pipelines WHERE id = :id"), {"id": pipeline_id})
     if not existing.fetchone():
         raise HTTPException(status_code=404, detail="Pipeline tidak ditemukan")
@@ -159,6 +194,11 @@ async def run_pipeline(
     if not steps:
         raise HTTPException(status_code=400, detail="Pipeline belum punya step")
 
+    for i, step in enumerate(steps, 1):
+        err = validate_step(step)
+        if err:
+            raise HTTPException(status_code=400, detail=f"Step {i} ({step['name']}): {err}")
+
     dag_id = generate_dag(pipeline_id, pipeline["name"], steps)
 
     await db.execute(
@@ -182,8 +222,21 @@ async def run_pipeline(
             {"r": airflow_result["run_id"], "s": "running", "d": dag_id},
         )
         await db.commit()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error("Airflow trigger failed for %s: %s", dag_id, e, exc_info=True)
+        try:
+            await db.execute(
+                text("UPDATE app.pipeline_runs SET status = 'failed' WHERE dag_id = :d AND status = 'running'"),
+                {"d": dag_id},
+            )
+            await db.execute(
+                text("UPDATE app.pipelines SET status = 'failed' WHERE id = :id"),
+                {"id": pipeline_id},
+            )
+            await db.commit()
+        except Exception:
+            logger.error("Failed to update status after trigger error", exc_info=True)
+        raise HTTPException(status_code=502, detail="Gagal trigger pipeline ke Airflow")
 
     return {"message": f"Pipeline '{pipeline['name']}' triggered", "dag_id": dag_id}
 

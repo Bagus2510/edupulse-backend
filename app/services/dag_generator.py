@@ -1,11 +1,32 @@
+import json
 import textwrap
 from pathlib import Path
+
+from app.core.config import settings
 
 
 def _get_dags_dir() -> Path:
     dags_dir = Path(__file__).resolve().parent.parent.parent.parent / "Apache_Airflow" / "dags"
     dags_dir.mkdir(parents=True, exist_ok=True)
     return dags_dir
+
+
+def _build_source_load(source_table: str) -> str:
+    """Generate code to load source table into DataFrame."""
+    return (
+        f"    hook = PostgresHook(postgres_conn_id=\"edupulse\")\n"
+        f"    engine = hook.get_sqlalchemy_engine()\n"
+        f"    df = pd.read_sql(\"SELECT * FROM {source_table}\", engine)\n"
+    )
+
+
+def _build_dest_save(dest_table: str) -> str:
+    """Generate code to save DataFrame to destination table."""
+    return (
+        f"    if not df.empty:\n"
+        f"        df.to_sql(\"{dest_table}\", engine, if_exists=\"replace\", index=False)\n"
+        f"        print(f\"Saved {{len(df)}} rows to {dest_table}\")\n"
+    )
 
 
 def generate_dag(pipeline_id: int, pipeline_name: str, steps: list[dict]) -> str:
@@ -15,41 +36,52 @@ def generate_dag(pipeline_id: int, pipeline_name: str, steps: list[dict]) -> str
     step_functions = []
     task_lines = []
     task_ids = []
+    var_names = []
 
     for i, step in enumerate(steps, 1):
         func_name = f"step_{i}"
-        task_ids.append(func_name)
+        var_names.append(func_name)
+        raw_task_id = step.get("name", f"Step {i}")
+        task_id = "".join(c if c.isalnum() or c == "_" else "_" for c in raw_task_id).strip("_") or f"step_{i}"
+        task_ids.append(task_id)
         query_type = step.get("query_type", "sql")
         query = step["query"]
+        source_table = step.get("source_table", "")
+        dest_table = step.get("dest_table", "")
 
         if query_type == "sql":
+            safe_query = json.dumps(query)
+            source_comment = f"    # Source: {source_table}\n" if source_table else ""
+            dest_comment = f"    # Dest: {dest_table}\n" if dest_table else ""
             body = (
                 f"def {func_name}():\n"
+                f"{source_comment}{dest_comment}"
                 f'    hook = PostgresHook(postgres_conn_id="edupulse")\n'
                 f"    conn = hook.get_conn()\n"
                 f"    cursor = conn.cursor()\n"
-                f'    cursor.execute("""{query}""")\n'
+                f"    cursor.execute({safe_query})\n"
                 f"    conn.commit()\n"
                 f"    cursor.close()\n"
                 f"    conn.close()"
             )
         else:
+            source_block = _build_source_load(source_table) if source_table else ""
+            dest_block = _build_dest_save(dest_table) if dest_table else ""
             body = (
                 f"def {func_name}():\n"
                 f'    hook = PostgresHook(postgres_conn_id="edupulse")\n'
-                f"    conn = hook.get_conn()\n"
-                f"    cursor = conn.cursor()\n"
-                f"    # Python transformation step\n"
+                f"    engine = hook.get_sqlalchemy_engine()\n"
+                f"{source_block}"
+                f"    # --- user transformation ---\n"
                 f"    {query}\n"
-                f"    conn.commit()\n"
-                f"    cursor.close()\n"
-                f"    conn.close()"
+                f"    # --- end transformation ---\n"
+                f"{dest_block}"
             )
 
         step_functions.append(body)
-        task_lines.append(f'    {func_name} = PythonOperator(task_id="{func_name}", python_callable={func_name})')
+        task_lines.append(f'    {func_name} = PythonOperator(task_id="{task_id}", python_callable={func_name})')
 
-    task_chain = " >> ".join(task_ids)
+    task_chain = " >> ".join(var_names)
     functions_block = "\n\n\n".join(step_functions)
     tasks_block = "\n".join(task_lines)
 
@@ -59,7 +91,8 @@ def generate_dag(pipeline_id: int, pipeline_name: str, steps: list[dict]) -> str
         f"from datetime import datetime, timedelta\n"
         f"from airflow import DAG\n"
         f"from airflow.operators.python import PythonOperator\n"
-        f'from airflow.providers.postgres.hooks.postgres import PostgresHook\n\n\n'
+        f'from airflow.providers.postgres.hooks.postgres import PostgresHook\n'
+        f"import pandas as pd\n\n\n"
         f"{functions_block}\n\n\n"
         f"default_args = {{\n"
         f'    "owner": "edupulse",\n'
