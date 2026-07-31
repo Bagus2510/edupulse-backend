@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException
 
 from app.models.schemas import DAGTriggerResponse, DAGStatusResponse
-from app.services.airflow_client import trigger_dag, get_dag_status
+from app.services.airflow_client import trigger_dag, get_dag_status, ensure_dag_unpaused
 
 router = APIRouter(
     prefix="/api/airflow",
@@ -12,6 +12,7 @@ router = APIRouter(
 @router.post("/dags/{dag_id}/trigger", response_model=DAGTriggerResponse)
 async def trigger(dag_id: str):
     try:
+        await ensure_dag_unpaused(dag_id)
         result = await trigger_dag(dag_id)
         return DAGTriggerResponse(**result)
     except Exception as e:

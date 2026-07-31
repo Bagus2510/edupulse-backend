@@ -78,16 +78,16 @@ async def create_pipeline(
             raise HTTPException(status_code=400, detail=f"Step {i} ({step.name}): {err}")
 
     result = await db.execute(
-        text("INSERT INTO app.pipelines (name, description, created_by) VALUES (:n, :d, :u) RETURNING id"),
-        {"n": payload.name, "d": payload.description, "u": current_user["id"]},
+        text("INSERT INTO app.pipelines (name, description, created_by, max_active_runs, on_failure_callback) VALUES (:n, :d, :u, :m, :f) RETURNING id"),
+        {"n": payload.name, "d": payload.description, "u": current_user["id"], "m": payload.max_active_runs, "f": payload.on_failure_callback},
     )
     pipeline_id = result.fetchone().id
     await db.commit()
 
     for i, step in enumerate(payload.steps, 1):
         await db.execute(
-            text("INSERT INTO app.pipeline_steps (pipeline_id, step_order, name, source_table, query, query_type, dest_table) VALUES (:p, :o, :n, :s, :q, :t, :d)"),
-            {"p": pipeline_id, "o": i, "n": step.name, "s": step.source_table, "q": step.query, "t": step.query_type, "d": step.dest_table},
+            text("INSERT INTO app.pipeline_steps (pipeline_id, step_order, name, source_table, query, query_type, dest_table, execution_timeout, retries, retry_delay) VALUES (:p, :o, :n, :s, :q, :t, :d, :et, :r, :rd)"),
+            {"p": pipeline_id, "o": i, "n": step.name, "s": step.source_table, "q": step.query, "t": step.query_type, "d": step.dest_table, "et": step.execution_timeout, "r": step.retries, "rd": step.retry_delay},
         )
     await db.commit()
 
@@ -146,16 +146,16 @@ async def update_pipeline(
         raise HTTPException(status_code=404, detail="Pipeline tidak ditemukan")
 
     await db.execute(
-        text("UPDATE app.pipelines SET name = :n, description = :d, updated_at = NOW() WHERE id = :id"),
-        {"n": payload.name, "d": payload.description, "id": pipeline_id},
+        text("UPDATE app.pipelines SET name = :n, description = :d, max_active_runs = :m, on_failure_callback = :f, updated_at = NOW() WHERE id = :id"),
+        {"n": payload.name, "d": payload.description, "m": payload.max_active_runs, "f": payload.on_failure_callback, "id": pipeline_id},
     )
     await db.execute(text("DELETE FROM app.pipeline_steps WHERE pipeline_id = :id"), {"id": pipeline_id})
     await db.commit()
 
     for i, step in enumerate(payload.steps, 1):
         await db.execute(
-            text("INSERT INTO app.pipeline_steps (pipeline_id, step_order, name, source_table, query, query_type, dest_table) VALUES (:p, :o, :n, :s, :q, :t, :d)"),
-            {"p": pipeline_id, "o": i, "n": step.name, "s": step.source_table, "q": step.query, "t": step.query_type, "d": step.dest_table},
+            text("INSERT INTO app.pipeline_steps (pipeline_id, step_order, name, source_table, query, query_type, dest_table, execution_timeout, retries, retry_delay) VALUES (:p, :o, :n, :s, :q, :t, :d, :et, :r, :rd)"),
+            {"p": pipeline_id, "o": i, "n": step.name, "s": step.source_table, "q": step.query, "t": step.query_type, "d": step.dest_table, "et": step.execution_timeout, "r": step.retries, "rd": step.retry_delay},
         )
     await db.commit()
 
@@ -186,6 +186,9 @@ async def run_pipeline(
     if not pipeline:
         raise HTTPException(status_code=404, detail="Pipeline tidak ditemukan")
 
+    if pipeline.get("status") == "running":
+        raise HTTPException(status_code=409, detail="Pipeline sedang berjalan. Tunggu hingga selesai.")
+
     steps_result = await db.execute(
         text("SELECT * FROM app.pipeline_steps WHERE pipeline_id = :id ORDER BY step_order"),
         {"id": pipeline_id},
@@ -199,7 +202,13 @@ async def run_pipeline(
         if err:
             raise HTTPException(status_code=400, detail=f"Step {i} ({step['name']}): {err}")
 
-    dag_id = generate_dag(pipeline_id, pipeline["name"], steps)
+    dag_id = generate_dag(
+        pipeline_id, 
+        pipeline["name"], 
+        steps,
+        max_active_runs=pipeline.get("max_active_runs", 1),
+        on_failure_callback=pipeline.get("on_failure_callback", ""),
+    )
 
     await db.execute(
         text("INSERT INTO app.pipeline_runs (dag_id, status, tasks_total, triggered_by) VALUES (:d, 'running', :t, :u)"),
@@ -253,13 +262,18 @@ async def pipeline_status(pipeline_id: int, db: AsyncSession = Depends(get_db)):
 
     dag_id = f"pipeline_{pipeline_id}"
     airflow_state = None
+    tasks_completed = run.tasks_completed or 0
+    tasks_total = run.tasks_total or 0
     try:
         airflow_result = await get_dag_status(dag_id)
         airflow_state = airflow_result.get("state")
+        tasks_completed = airflow_result.get("tasks_completed", tasks_completed)
+        tasks_total = airflow_result.get("tasks_total", tasks_total)
+
         if airflow_state and airflow_state in ("success", "failed"):
             await db.execute(
-                text("UPDATE app.pipeline_runs SET status = :s WHERE dag_id = :d AND status = 'running'"),
-                {"s": airflow_state, "d": dag_id},
+                text("UPDATE app.pipeline_runs SET status = :s, tasks_completed = :tc WHERE dag_id = :d AND status = 'running'"),
+                {"s": airflow_state, "tc": tasks_completed, "d": dag_id},
             )
             await db.execute(
                 text("UPDATE app.pipelines SET status = :s WHERE id = :id"),
@@ -274,8 +288,8 @@ async def pipeline_status(pipeline_id: int, db: AsyncSession = Depends(get_db)):
         "dag_id": dag_id,
         "run_id": run.run_id,
         "status": airflow_state or run.status,
-        "tasks_total": run.tasks_total,
-        "tasks_completed": run.tasks_completed,
+        "tasks_total": tasks_total,
+        "tasks_completed": tasks_completed,
         "created_at": str(run.created_at),
     }
 
@@ -305,6 +319,9 @@ async def _get_pipeline(pipeline_id: int, db: AsyncSession) -> PipelineResponse:
             query=r.query,
             query_type=r.query_type,
             dest_table=r.dest_table,
+            execution_timeout=getattr(r, 'execution_timeout', 300),
+            retries=getattr(r, 'retries', 1),
+            retry_delay=getattr(r, 'retry_delay', 5),
         )
         for r in steps_result.fetchall()
     ]
@@ -315,6 +332,8 @@ async def _get_pipeline(pipeline_id: int, db: AsyncSession) -> PipelineResponse:
         description=pipeline["description"],
         status=pipeline["status"],
         last_run_at=str(pipeline["last_run_at"]) if pipeline["last_run_at"] else None,
+        max_active_runs=pipeline.get("max_active_runs", 1),
+        on_failure_callback=pipeline.get("on_failure_callback", ""),
         steps=steps,
         created_at=str(pipeline["created_at"]),
         updated_at=str(pipeline["updated_at"]),

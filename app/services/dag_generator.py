@@ -11,25 +11,16 @@ def _get_dags_dir() -> Path:
     return dags_dir
 
 
-def _build_source_load(source_table: str) -> str:
-    """Generate code to load source table into DataFrame."""
-    return (
-        f"    hook = PostgresHook(postgres_conn_id=\"edupulse\")\n"
-        f"    engine = hook.get_sqlalchemy_engine()\n"
-        f"    df = pd.read_sql(\"SELECT * FROM {source_table}\", engine)\n"
-    )
+def _indent_user_code(code: str, indent: int = 4) -> str:
+    """Indent user code properly inside a function body."""
+    lines = code.strip().splitlines()
+    if not lines:
+        return ""
+    padded = " " * indent
+    return "\n".join(padded + line if line.strip() else "" for line in lines)
 
 
-def _build_dest_save(dest_table: str) -> str:
-    """Generate code to save DataFrame to destination table."""
-    return (
-        f"    if not df.empty:\n"
-        f"        df.to_sql(\"{dest_table}\", engine, if_exists=\"replace\", index=False)\n"
-        f"        print(f\"Saved {{len(df)}} rows to {dest_table}\")\n"
-    )
-
-
-def generate_dag(pipeline_id: int, pipeline_name: str, steps: list[dict]) -> str:
+def generate_dag(pipeline_id: int, pipeline_name: str, steps: list[dict], max_active_runs: int = 1, on_failure_callback: str = "") -> str:
     dag_id = f"pipeline_{pipeline_id}"
     safe_name = "".join(c if c.isalnum() else "_" for c in pipeline_name)
 
@@ -48,6 +39,9 @@ def generate_dag(pipeline_id: int, pipeline_name: str, steps: list[dict]) -> str
         query = step["query"]
         source_table = step.get("source_table", "")
         dest_table = step.get("dest_table", "")
+        execution_timeout = step.get("execution_timeout", 300)
+        retries = step.get("retries", 1)
+        retry_delay = step.get("retry_delay", 5)
 
         if query_type == "sql":
             safe_query = json.dumps(query)
@@ -65,21 +59,46 @@ def generate_dag(pipeline_id: int, pipeline_name: str, steps: list[dict]) -> str
                 f"    conn.close()"
             )
         else:
-            source_block = _build_source_load(source_table) if source_table else ""
-            dest_block = _build_dest_save(dest_table) if dest_table else ""
-            body = (
-                f"def {func_name}():\n"
-                f'    hook = PostgresHook(postgres_conn_id="edupulse")\n'
-                f"    engine = hook.get_sqlalchemy_engine()\n"
-                f"{source_block}"
-                f"    # --- user transformation ---\n"
-                f"    {query}\n"
-                f"    # --- end transformation ---\n"
-                f"{dest_block}"
-            )
+            # Python step — only init hook/engine if source or dest tables exist
+            user_code = _indent_user_code(query)
+            if source_table or dest_table:
+                body = (
+                    f"def {func_name}():\n"
+                    f'    hook = PostgresHook(postgres_conn_id="edupulse")\n'
+                    f"    engine = hook.get_sqlalchemy_engine()\n"
+                )
+                if source_table:
+                    body += f'    df = pd.read_sql("SELECT * FROM {source_table}", engine)\n'
+                body += (
+                    f"    # --- user transformation ---\n"
+                    f"{user_code}\n"
+                    f"    # --- end transformation ---\n"
+                )
+                if dest_table:
+                    body += (
+                        f'    if not df.empty:\n'
+                        f'        df.to_sql("{dest_table}", engine, if_exists="replace", index=False)\n'
+                        f'        print(f"Saved {{len(df)}} rows to {dest_table}")\n'
+                    )
+            else:
+                # Pure Python step — no DB connection needed
+                body = (
+                    f"def {func_name}():\n"
+                    f"    # --- user transformation ---\n"
+                    f"{user_code}\n"
+                    f"    # --- end transformation ---\n"
+                )
 
         step_functions.append(body)
-        task_lines.append(f'    {func_name} = PythonOperator(task_id="{task_id}", python_callable={func_name})')
+        task_lines.append(
+            f'    {func_name} = PythonOperator(\n'
+            f'        task_id="{task_id}",\n'
+            f'        python_callable={func_name},\n'
+            f'        execution_timeout=timedelta(seconds={execution_timeout}),\n'
+            f'        retries={retries},\n'
+            f'        retry_delay=timedelta(minutes={retry_delay}),\n'
+            f'    )'
+        )
 
     task_chain = " >> ".join(var_names)
     functions_block = "\n\n\n".join(step_functions)
@@ -107,6 +126,7 @@ def generate_dag(pipeline_id: int, pipeline_name: str, steps: list[dict]) -> str
         f"    schedule_interval=None,\n"
         f"    start_date=datetime(2026, 1, 1),\n"
         f"    catchup=False,\n"
+        f"    max_active_runs={max_active_runs},\n"
         f'    tags=["edupulse", "auto-generated"],\n'
         f") as dag:\n"
         f"{tasks_block}\n\n"

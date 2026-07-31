@@ -1,8 +1,9 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
 
 from app.core.config import settings
-from app.core.database import check_db_connection
+from app.core.database import check_db_connection, async_session
 from app.routers import superset, airflow, ai, settings as settings_router, dashboards, activity, pipeline, auth, pipelines, home, datasets
 
 app = FastAPI(
@@ -30,6 +31,20 @@ app.include_router(auth.router)
 app.include_router(pipelines.router)
 app.include_router(home.router)
 app.include_router(datasets.router)
+
+
+@app.on_event("startup")
+async def ensure_schemas():
+    async with async_session() as session:
+        await session.execute(text("CREATE SCHEMA IF NOT EXISTS raw"))
+        await session.execute(text("CREATE SCHEMA IF NOT EXISTS mart"))
+        # Add new columns if they don't exist
+        await session.execute(text("ALTER TABLE app.pipelines ADD COLUMN IF NOT EXISTS max_active_runs INTEGER DEFAULT 1"))
+        await session.execute(text("ALTER TABLE app.pipelines ADD COLUMN IF NOT EXISTS on_failure_callback VARCHAR(255) DEFAULT ''"))
+        await session.execute(text("ALTER TABLE app.pipeline_steps ADD COLUMN IF NOT EXISTS execution_timeout INTEGER DEFAULT 300"))
+        await session.execute(text("ALTER TABLE app.pipeline_steps ADD COLUMN IF NOT EXISTS retries INTEGER DEFAULT 1"))
+        await session.execute(text("ALTER TABLE app.pipeline_steps ADD COLUMN IF NOT EXISTS retry_delay INTEGER DEFAULT 5"))
+        await session.commit()
 
 
 @app.get("/api/health")

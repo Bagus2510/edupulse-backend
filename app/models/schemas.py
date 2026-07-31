@@ -116,6 +116,9 @@ class PipelineStepCreate(BaseModel):
     query: str
     query_type: str = "sql"
     dest_table: str = ""
+    execution_timeout: int = 300
+    retries: int = 1
+    retry_delay: int = 5
 
 
 class PipelineStepResponse(BaseModel):
@@ -127,11 +130,16 @@ class PipelineStepResponse(BaseModel):
     query: str
     query_type: str
     dest_table: str | None
+    execution_timeout: int | None = 300
+    retries: int | None = 1
+    retry_delay: int | None = 5
 
 
 class PipelineCreate(BaseModel):
     name: str
     description: str = ""
+    max_active_runs: int = 1
+    on_failure_callback: str = ""
     steps: list[PipelineStepCreate] = []
 
 
@@ -141,6 +149,8 @@ class PipelineResponse(BaseModel):
     description: str | None
     status: str
     last_run_at: str | None
+    max_active_runs: int | None = 1
+    on_failure_callback: str | None = ""
     steps: list[PipelineStepResponse] = []
     created_at: str
     updated_at: str
