@@ -37,7 +37,7 @@ async def list_pipelines(db: AsyncSession = Depends(get_db)):
             try:
                 airflow_result = await get_dag_status(r.dag_id)
                 airflow_state = airflow_result.get("state")
-                if airflow_state and airflow_state in ("success", "failed"):
+                if airflow_state and airflow_state in ("success", "failed", "queued"):
                     await db.execute(
                         text("UPDATE app.pipeline_runs SET status = :s WHERE dag_id = :d AND status = 'running'"),
                         {"s": airflow_state, "d": r.dag_id},
@@ -116,7 +116,7 @@ async def list_tables(
     current_user: dict = Depends(get_current_user),
 ):
     result = await db.execute(
-        text("SELECT table_schema, table_name FROM information_schema.tables WHERE table_schema IN ('raw', 'mart') ORDER BY table_schema, table_name")
+        text("SELECT table_schema, table_name FROM information_schema.tables WHERE table_schema = 'raw' ORDER BY table_name")
     )
     rows = result.fetchall()
     return [
@@ -382,7 +382,7 @@ async def pipeline_status(pipeline_id: int, db: AsyncSession = Depends(get_db)):
         tasks_completed = airflow_result.get("tasks_completed", tasks_completed)
         tasks_total = airflow_result.get("tasks_total", tasks_total)
 
-        if airflow_state and airflow_state in ("success", "failed"):
+        if airflow_state and airflow_state in ("success", "failed", "queued"):
             await db.execute(
                 text("UPDATE app.pipeline_runs SET status = :s, tasks_completed = :tc WHERE dag_id = :d AND status = 'running'"),
                 {"s": airflow_state, "tc": tasks_completed, "d": dag_id},

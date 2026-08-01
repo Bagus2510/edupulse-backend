@@ -114,6 +114,11 @@ async def get_dag_status(dag_id: str) -> dict:
                         1 for ti in task_instances
                         if ti.get("state") in ("success", "failed", "skipped")
                     )
+                    # Count queued tasks (not yet started)
+                    tasks_queued = sum(
+                        1 for ti in task_instances
+                        if ti.get("state") == "queued"
+                    )
                     # If any task is failed and no retries left, mark as failed
                     any_failed = any(ti.get("state") == "failed" for ti in task_instances)
                     if any_failed:

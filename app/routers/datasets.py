@@ -63,6 +63,42 @@ async def list_datasets(
     ]
 
 
+@router.get("/mart", response_model=list[TableInfo])
+async def list_mart_datasets(
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    result = await db.execute(
+        text(
+            "SELECT t.table_schema, t.table_name, "
+            "COALESCE(pg_stats.n_live_tup, 0) AS row_count, "
+            "COALESCE(col_info.column_count, 0) AS column_count "
+            "FROM information_schema.tables t "
+            "LEFT JOIN pg_stat_user_tables pg_stats "
+            "ON pg_stats.schemaname = t.table_schema AND pg_stats.relname = t.table_name "
+            "LEFT JOIN ("
+            "  SELECT table_schema, table_name, COUNT(*) AS column_count "
+            "  FROM information_schema.columns "
+            "  WHERE table_schema = 'mart' "
+            "  GROUP BY table_schema, table_name"
+            ") col_info ON col_info.table_schema = t.table_schema AND col_info.table_name = t.table_name "
+            "WHERE t.table_schema = 'mart' "
+            "ORDER BY t.table_name"
+        )
+    )
+    rows = result.fetchall()
+    return [
+        TableInfo(
+            schema_name=r.table_schema,
+            table_name=r.table_name,
+            full_name=f"{r.table_schema}.{r.table_name}",
+            row_count=r.row_count,
+            column_count=r.column_count,
+        )
+        for r in rows
+    ]
+
+
 @router.get("/{schema_name}.{table_name}/info")
 async def table_info(
     schema_name: Annotated[str, Path(description="Schema name (raw or mart)")],
