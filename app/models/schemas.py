@@ -140,17 +140,20 @@ class PipelineCreate(BaseModel):
     description: str = ""
     max_active_runs: int = 1
     on_failure_callback: str = ""
+    schedule_interval: str = ""
     steps: list[PipelineStepCreate] = []
 
 
 class PipelineResponse(BaseModel):
     id: int
+    dag_id: str = ""
     name: str
     description: str | None
     status: str
     last_run_at: str | None
     max_active_runs: int | None = 1
     on_failure_callback: str | None = ""
+    schedule_interval: str | None = ""
     steps: list[PipelineStepResponse] = []
     created_at: str
     updated_at: str

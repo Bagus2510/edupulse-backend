@@ -41,6 +41,8 @@ async def ensure_schemas():
         # Add new columns if they don't exist
         await session.execute(text("ALTER TABLE app.pipelines ADD COLUMN IF NOT EXISTS max_active_runs INTEGER DEFAULT 1"))
         await session.execute(text("ALTER TABLE app.pipelines ADD COLUMN IF NOT EXISTS on_failure_callback VARCHAR(255) DEFAULT ''"))
+        await session.execute(text("ALTER TABLE app.pipelines ADD COLUMN IF NOT EXISTS dag_id TEXT DEFAULT ''"))
+        await session.execute(text("ALTER TABLE app.pipelines ADD COLUMN IF NOT EXISTS schedule_interval TEXT DEFAULT ''"))
         await session.execute(text("ALTER TABLE app.pipeline_steps ADD COLUMN IF NOT EXISTS execution_timeout INTEGER DEFAULT 300"))
         await session.execute(text("ALTER TABLE app.pipeline_steps ADD COLUMN IF NOT EXISTS retries INTEGER DEFAULT 1"))
         await session.execute(text("ALTER TABLE app.pipeline_steps ADD COLUMN IF NOT EXISTS retry_delay INTEGER DEFAULT 5"))
