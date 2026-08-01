@@ -1,9 +1,12 @@
 import json
+import logging
 
 from google import genai
 from google.genai import types
 
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """You are an academic data analyst for EduPulse, an education analytics platform.
 
@@ -97,4 +100,16 @@ async def analyze_dashboard(
     if text.startswith("```"):
         text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
 
-    return json.loads(text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        logger.warning("Failed to parse Gemini response as JSON: %s — returning fallback", e)
+        return {
+            "dashboard_type": "unknown",
+            "summary": text[:500] if text else "Tidak ada response dari AI",
+            "key_findings": ["Response tidak dapat diparse sebagai JSON yang valid"],
+            "trend": "stabil",
+            "business_recommendation": "Silakan coba lagi atau hubungi admin jika masalah berlanjut",
+            "potential_issue": f"JSON parse error: {str(e)[:200]}",
+            "confidence": 0.0,
+        }

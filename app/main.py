@@ -1,9 +1,12 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi.errors import RateLimitExceeded
+from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from app.core.config import settings
 from app.core.database import check_db_connection, async_session
+from app.core.rate_limit import limiter
 from app.routers import superset, airflow, ai, settings as settings_router, dashboards, activity, pipeline, auth, pipelines, home, datasets
 
 app = FastAPI(
@@ -11,6 +14,16 @@ app = FastAPI(
     description="Backend API for EduPulse Analytics Platform",
     version="1.0.0",
 )
+
+app.state.limiter = limiter
+
+
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request, exc):
+    return JSONResponse(
+        status_code=429,
+        content={"detail": f"Terlalu banyak request. Coba lagi dalam {exc.detail}."},
+    )
 
 app.add_middleware(
     CORSMiddleware,

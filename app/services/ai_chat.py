@@ -1,9 +1,9 @@
 import json
 import logging
 from collections import defaultdict
+from typing import AsyncGenerator
 
 from langchain_core.chat_history import InMemoryChatMessageHistory
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_google_genai import ChatGoogleGenerativeAI
 
@@ -24,10 +24,10 @@ ATURAN KETAT:
 
 Konteks chart data akan diberikan di awal percakapan. Analisis berdasarkan data NYATA, bukan asumsi."""
 
-# In-memory session store: session_id -> InMemoryChatMessageHistory
+MAX_HISTORY_MESSAGES = 20
+
 _sessions: dict[str, InMemoryChatMessageHistory] = defaultdict(InMemoryChatMessageHistory)
 
-# Cache chart data per dashboard to avoid repeated Superset calls
 _chart_cache: dict[str, list[dict]] = {}
 
 
@@ -93,8 +93,32 @@ def clear_chat_history(session_id: str) -> None:
     """Clear chat history for a session."""
     if session_id in _sessions:
         del _sessions[session_id]
-    # Also clear chart cache if needed
     logger.info("Cleared chat history for session %s", session_id)
+
+
+def _trim_history(history: InMemoryChatMessageHistory) -> None:
+    """Trim history to MAX_HISTORY_MESSAGES, always keep context message if present."""
+    if len(history.messages) <= MAX_HISTORY_MESSAGES:
+        return
+    messages = history.messages
+    if len(messages) > 1 and messages[0].content and "Chart data:" in str(messages[0].content):
+        context_msg = messages[0]
+        recent = messages[-(MAX_HISTORY_MESSAGES - 1):]
+        history.messages = [context_msg] + list(recent)
+    else:
+        history.messages = messages[-MAX_HISTORY_MESSAGES:]
+
+
+def _build_prompt_context(
+    dashboard_uuid: str, dashboard_title: str, chart_context: str
+) -> str:
+    """Build the context message for first message."""
+    return (
+        f"Dashboard: {dashboard_title}\n"
+        f"UUID: {dashboard_uuid}\n\n"
+        f"Chart data:\n{chart_context}\n\n"
+        f"Sekarang analisis data di atas. User akan bertanya tentang data ini."
+    )
 
 
 async def chat(
@@ -107,37 +131,72 @@ async def chat(
     llm = _get_llm()
     history = get_chat_history(session_id)
 
-    # Get chart context
     chart_context = await _get_chart_context(dashboard_uuid)
 
-    # Build prompt
     prompt = ChatPromptTemplate.from_messages([
         ("system", SYSTEM_PROMPT),
         MessagesPlaceholder(variable_name="chat_history"),
         ("human", "{input}"),
     ])
 
-    # If this is first message, add chart context
     if len(history.messages) == 0:
-        context_msg = (
-            f"Dashboard: {dashboard_title}\n"
-            f"UUID: {dashboard_uuid}\n\n"
-            f"Chart data:\n{chart_context}\n\n"
-            f"Sekarang analisis data di atas. User akan bertanya tentang data ini."
-        )
+        context_msg = _build_prompt_context(dashboard_uuid, dashboard_title, chart_context)
         history.add_user_message(context_msg)
 
-    # Add user message
     history.add_user_message(message)
+    _trim_history(history)
 
-    # Invoke chain
-    chain = prompt
+    chain = prompt | llm
     response = await chain.ainvoke({
         "chat_history": history.messages,
         "input": message,
     })
 
-    # Add AI response to history
     history.add_ai_message(response.content)
 
     return response.content
+
+
+async def chat_stream(
+    message: str,
+    dashboard_uuid: str,
+    session_id: str,
+    dashboard_title: str = "",
+) -> AsyncGenerator[str, None]:
+    """Stream chat response chunk by chunk."""
+    llm = _get_llm()
+    history = get_chat_history(session_id)
+
+    chart_context = await _get_chart_context(dashboard_uuid)
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", SYSTEM_PROMPT),
+        MessagesPlaceholder(variable_name="chat_history"),
+        ("human", "{input}"),
+    ])
+
+    if len(history.messages) == 0:
+        context_msg = _build_prompt_context(dashboard_uuid, dashboard_title, chart_context)
+        history.add_user_message(context_msg)
+
+    history.add_user_message(message)
+    _trim_history(history)
+
+    chain = prompt | llm
+
+    full_response = ""
+    try:
+        async for chunk in chain.astream({
+            "chat_history": history.messages,
+            "input": message,
+        }):
+            if chunk.content:
+                full_response += chunk.content
+                yield chunk.content
+    except Exception as e:
+        logger.error("Stream error: %s", e)
+        error_msg = "Terjadi kesalahan saat memproses response. Silakan coba lagi."
+        full_response = error_msg
+        yield error_msg
+
+    history.add_ai_message(full_response)
