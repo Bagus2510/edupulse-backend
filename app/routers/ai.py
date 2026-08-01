@@ -2,7 +2,7 @@ import logging
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.sse import EventSourceResponse
+from fastapi.responses import StreamingResponse
 
 from app.core.security import get_current_user
 from app.core.rate_limit import limiter
@@ -14,7 +14,10 @@ from app.models.schemas import (
     ChatClearRequest,
 )
 from app.services.gemini_client import analyze_dashboard
-from app.services.ai_chat import chat, chat_stream, clear_chat_history
+from app.services.ai_chat import (
+    chat, chat_stream, clear_chat_history,
+    list_sessions, get_session_history, delete_session,
+)
 from app.services.superset_data import get_dashboard_data
 
 logger = logging.getLogger(__name__)
@@ -62,6 +65,7 @@ async def chat_endpoint(request: Request, req: ChatRequest, user: CurrentUserDep
             dashboard_uuid=req.dashboard_uuid,
             session_id=req.session_id,
             dashboard_title=req.dashboard_title,
+            user_id=user["id"],
         )
         return ChatResponse(response=response, session_id=req.session_id)
     except HTTPException:
@@ -75,18 +79,47 @@ async def chat_endpoint(request: Request, req: ChatRequest, user: CurrentUserDep
 @limiter.limit("20/minute")
 async def chat_stream_endpoint(request: Request, req: ChatRequest, user: CurrentUserDep):
     async def event_generator():
-        async for chunk in chat_stream(
-            message=req.message,
-            dashboard_uuid=req.dashboard_uuid,
-            session_id=req.session_id,
-            dashboard_title=req.dashboard_title,
-        ):
-            yield {"data": chunk}
+        try:
+            async for chunk in chat_stream(
+                message=req.message,
+                dashboard_uuid=req.dashboard_uuid,
+                session_id=req.session_id,
+                dashboard_title=req.dashboard_title,
+                user_id=user["id"],
+            ):
+                yield f"data: {chunk.replace(chr(10), '\\n')}\n\n"
+        except Exception as e:
+            logger.error("Stream error: %s", e)
+            yield f"data: Error: Gagal memproses response\n\n"
+        yield "data: [DONE]\n\n"
 
-    return EventSourceResponse(event_generator())
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.post("/chat/clear")
 async def clear_chat(req: ChatClearRequest, user: CurrentUserDep):
     clear_chat_history(req.session_id)
     return {"status": "ok", "session_id": req.session_id}
+
+
+@router.get("/chat/sessions")
+async def get_chat_sessions(request: Request, user: CurrentUserDep):
+    dashboard_uuid = request.query_params.get("dashboard_uuid")
+    sessions = await list_sessions(dashboard_uuid=dashboard_uuid)
+    return sessions
+
+
+@router.get("/chat/history/{session_id}")
+async def get_chat_history_endpoint(session_id: str, user: CurrentUserDep):
+    messages = await get_session_history(session_id)
+    return messages
+
+
+@router.delete("/chat/sessions/{session_id}")
+async def delete_chat_session(session_id: str, user: CurrentUserDep):
+    await delete_session(session_id)
+    return {"status": "ok"}

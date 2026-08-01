@@ -1,118 +1,145 @@
 import json
+import logging
 
-import httpx
+import asyncpg
 
 from app.core.config import settings
 
+logger = logging.getLogger(__name__)
 
-async def _login(client: httpx.AsyncClient) -> str:
-    resp = await client.post(
-        f"{settings.SUPERSET_URL}/api/v1/security/login",
-        json={
-            "username": settings.SUPERSET_USERNAME,
-            "password": settings.SUPERSET_PASSWORD,
-            "provider": "db",
-            "refresh": True,
-        },
+
+async def _get_superset_pool():
+    return await asyncpg.create_pool(
+        host=settings.SUPERSET_DB_HOST,
+        port=settings.SUPERSET_DB_PORT,
+        user=settings.SUPERSET_DB_USER,
+        password=settings.SUPERSET_DB_PASSWORD,
+        database=settings.SUPERSET_DB_NAME,
     )
-    resp.raise_for_status()
-    return resp.json()["access_token"]
 
 
-def _csrf_headers(client: httpx.AsyncClient, access_token: str) -> dict:
-    csrf = client.cookies.get("csrf_token") or client.cookies.get("XSRF-TOKEN", "")
-    headers = {"Authorization": f"Bearer {access_token}"}
-    if csrf:
-        headers["X-CSRFToken"] = csrf
-    return headers
+async def _get_edupulse_pool():
+    return await asyncpg.create_pool(
+        host=settings.DB_HOST,
+        port=settings.DB_PORT,
+        user=settings.DB_USER,
+        password=settings.DB_PASSWORD,
+        database=settings.DB_NAME,
+    )
 
 
 async def get_dashboard_charts(dashboard_uuid: str) -> list[dict]:
-    """Fetch chart IDs from a dashboard."""
-    async with httpx.AsyncClient() as client:
-        token = await _login(client)
-        headers = _csrf_headers(client, token)
+    """Fetch chart IDs and table info from a dashboard by UUID."""
+    pool = await _get_superset_pool()
+    try:
+        async with pool.acquire() as conn:
+            # Try embedded_dashboards first
+            row = await conn.fetchrow(
+                """
+                SELECT d.position_json
+                FROM embedded_dashboards ed
+                JOIN dashboards d ON d.id = ed.dashboard_id
+                WHERE ed.uuid = $1
+                """,
+                dashboard_uuid,
+            )
 
-        resp = await client.get(
-            f"{settings.SUPERSET_URL}/api/v1/dashboard/{dashboard_uuid}",
-            headers=headers,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        result = data.get("result", {})
-        position_json = result.get("position_json")
+            if not row:
+                row = await conn.fetchrow(
+                    "SELECT position_json FROM dashboards WHERE uuid = $1",
+                    dashboard_uuid,
+                )
 
-        if not position_json:
-            return []
+            if not row or not row["position_json"]:
+                logger.warning("Dashboard with UUID %s not found or no position_json", dashboard_uuid)
+                return []
 
-        if isinstance(position_json, str):
-            position_json = json.loads(position_json)
+            position_json = row["position_json"]
+            if isinstance(position_json, str):
+                position_json = json.loads(position_json)
 
-        charts = []
-        for key, val in position_json.items():
-            if key.startswith("CHART-") and isinstance(val, dict):
-                meta = val.get("meta", {})
-                chart_id = meta.get("chartId") or val.get("id")
-                if chart_id:
-                    charts.append({
-                        "id": chart_id,
-                        "name": meta.get("sliceName", f"Chart {chart_id}"),
-                    })
-        return charts
+            charts = []
+            for key, val in position_json.items():
+                if key.startswith("CHART-") and isinstance(val, dict):
+                    meta = val.get("meta", {})
+                    chart_id = meta.get("chartId") or val.get("id")
+                    if chart_id:
+                        # Look up table info from slices + tables
+                        slice_row = await conn.fetchrow(
+                            """
+                            SELECT s.id, s.slice_name, s.viz_type,
+                                   t.table_name, t.schema
+                            FROM slices s
+                            LEFT JOIN tables t ON t.id = (s.query_context::json->'datasource'->>'id')::int
+                            WHERE s.id = $1
+                            """,
+                            chart_id,
+                        )
+                        charts.append({
+                            "id": chart_id,
+                            "name": meta.get("sliceName", f"Chart {chart_id}"),
+                            "table_name": slice_row["table_name"] if slice_row else None,
+                            "schema": slice_row["schema"] if slice_row else None,
+                        })
+            return charts
+    finally:
+        await pool.close()
 
 
-async def get_chart_data(chart_id: int) -> dict:
-    """Fetch chart data (limited rows for AI analysis)."""
-    async with httpx.AsyncClient() as client:
-        token = await _login(client)
-        headers = _csrf_headers(client, token)
+async def get_chart_data(chart_id: int, table_name: str = None, schema: str = None) -> dict:
+    """Fetch chart data by querying edupulse DB directly."""
+    chart_name = f"Chart {chart_id}"
 
-        resp = await client.get(
-            f"{settings.SUPERSET_URL}/api/v1/chart/{chart_id}",
-            headers=headers,
-        )
-        resp.raise_for_status()
-        chart = resp.json().get("result", {})
+    # Get chart name from Superset DB if not provided
+    if not table_name:
+        spool = await _get_superset_pool()
+        try:
+            async with spool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT s.slice_name, s.viz_type,
+                           t.table_name, t.schema
+                    FROM slices s
+                    LEFT JOIN tables t ON t.id = (s.query_context::json->'datasource'->>'id')::int
+                    WHERE s.id = $1
+                    """,
+                    chart_id,
+                )
+                if row:
+                    chart_name = row["slice_name"] or chart_name
+                    table_name = row["table_name"]
+                    schema = row["schema"]
+        finally:
+            await spool.close()
 
-        query_context = chart.get("query_context")
-        if not query_context:
+    if not table_name:
+        return {"id": chart_id, "name": chart_name, "viz_type": "unknown", "data": None}
+
+    # Query edupulse DB directly
+    epool = await _get_edupulse_pool()
+    try:
+        async with epool.acquire() as conn:
+            query = f'SELECT * FROM "{schema}"."{table_name}" LIMIT 50'
+            rows = await conn.fetch(query)
+            data = [dict(r) for r in rows]
+
+            # Convert non-serializable types
+            for row in data:
+                for k, v in row.items():
+                    if hasattr(v, 'isoformat'):
+                        row[k] = str(v)
+
             return {
                 "id": chart_id,
-                "name": chart.get("slice_name", f"Chart {chart_id}"),
-                "viz_type": chart.get("viz_type", "unknown"),
-                "data": None,
+                "name": chart_name,
+                "viz_type": "unknown",
+                "data": data,
             }
-
-        if isinstance(query_context, str):
-            query_context = json.loads(query_context)
-
-        data_resp = await client.post(
-            f"{settings.SUPERSET_URL}/api/v1/chart/data",
-            headers={**headers, "Content-Type": "application/json"},
-            json=query_context,
-        )
-
-        if data_resp.status_code != 200:
-            return {
-                "id": chart_id,
-                "name": chart.get("slice_name", f"Chart {chart_id}"),
-                "viz_type": chart.get("viz_type", "unknown"),
-                "data": None,
-            }
-
-        results = data_resp.json().get("result", [])
-        rows = []
-        for r in results:
-            if "data" in r:
-                rows = r["data"][:50]  # limit to 50 rows
-                break
-
-        return {
-            "id": chart_id,
-            "name": chart.get("slice_name", f"Chart {chart_id}"),
-            "viz_type": chart.get("viz_type", "unknown"),
-            "data": rows,
-        }
+    except Exception as e:
+        logger.error("Failed to query %s.%s: %s", schema, table_name, e)
+        return {"id": chart_id, "name": chart_name, "viz_type": "unknown", "data": None}
+    finally:
+        await epool.close()
 
 
 async def get_dashboard_data(dashboard_uuid: str) -> list[dict]:
@@ -120,6 +147,6 @@ async def get_dashboard_data(dashboard_uuid: str) -> list[dict]:
     charts = await get_dashboard_charts(dashboard_uuid)
     results = []
     for chart in charts:
-        data = await get_chart_data(chart["id"])
+        data = await get_chart_data(chart["id"], chart.get("table_name"), chart.get("schema"))
         results.append(data)
     return results

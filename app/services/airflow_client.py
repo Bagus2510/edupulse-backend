@@ -129,3 +129,21 @@ async def get_dag_status(dag_id: str) -> dict:
             "tasks_completed": tasks_completed,
             "execution_date": latest.get("execution_date"),
         }
+
+
+async def cancel_dag_run(dag_id: str, run_id: str) -> dict:
+    """Set a DAG run state to 'failed' to interrupt a running pipeline."""
+    async with httpx.AsyncClient() as client:
+        encoded = urllib.parse.quote(run_id, safe="")
+        resp = await client.patch(
+            f"{settings.AIRFLOW_URL}/api/v1/dags/{dag_id}/dagRuns/{encoded}",
+            auth=(settings.AIRFLOW_USERNAME, settings.AIRFLOW_PASSWORD),
+            json={"state": "failed"},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return {
+            "dag_id": dag_id,
+            "run_id": run_id,
+            "state": data.get("state"),
+        }

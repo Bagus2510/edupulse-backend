@@ -8,22 +8,22 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """You are an academic data analyst for EduPulse, an education analytics platform.
+DEFAULT_SYSTEM_PROMPT = """You are a data analyst for an analytics platform.
 
 Given dashboard title and REAL chart data from Apache Superset, generate a structured insight.
 
 Rules:
 - Base analysis on ACTUAL data values, not assumptions
 - Identify real patterns, outliers, and trends from the numbers
-- Provide specific numbers in findings (e.g., "rata-rata nilai 78.5")
+- Provide specific numbers in findings (e.g., "average value 78.5")
 - If data is empty or limited, acknowledge it honestly
 
 Respond ONLY with valid JSON with these fields:
 {
-  "dashboard_type": "string (category: akademik, keuangan, operasional, etc)",
+  "dashboard_type": "string (category: sales, finance, operations, academic, etc)",
   "summary": "string (2-3 sentences overview based on real data)",
   "key_findings": ["string (specific finding with numbers)", ...],
-  "trend": "string (one of: naik, turun, stabil)",
+  "trend": "string (one of: increasing, decreasing, stable)",
   "business_recommendation": "string (actionable recommendation based on data)",
   "potential_issue": "string or null (concern to watch)",
   "confidence": "float (0.0-1.0, based on data quality/quantity)"
@@ -72,6 +72,7 @@ async def analyze_dashboard(
     chart_data: list[dict] | None = None,
 ) -> dict:
     client = _get_client()
+    system_prompt = settings.GEMINI_SYSTEM_PROMPT or DEFAULT_SYSTEM_PROMPT
 
     if chart_data:
         data_str = _format_chart_data(chart_data)
@@ -92,7 +93,7 @@ async def analyze_dashboard(
         model=settings.GEMINI_MODEL,
         contents=user_msg,
         config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
+            system_instruction=system_prompt,
         ),
     )
 

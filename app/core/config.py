@@ -14,6 +14,13 @@ class Settings(BaseSettings):
     SUPERSET_USERNAME: str = "admin"
     SUPERSET_PASSWORD: str = "admin"
 
+    # Superset Metadata DB (for direct query)
+    SUPERSET_DB_HOST: str = "localhost"
+    SUPERSET_DB_PORT: int = 5434
+    SUPERSET_DB_USER: str = "superset"
+    SUPERSET_DB_PASSWORD: str = "superset123"
+    SUPERSET_DB_NAME: str = "superset"
+
     # Airflow
     AIRFLOW_URL: str = "http://localhost:8080"
     AIRFLOW_USERNAME: str = "airflow"
@@ -25,6 +32,11 @@ class Settings(BaseSettings):
     # Gemini
     GEMINI_API_KEY: str = ""
     GEMINI_MODEL: str = "gemini-2.5-flash"
+
+    # AI Prompts (kosong = pakai default bawaan)
+    GEMINI_SYSTEM_PROMPT: str = ""
+    GEMINI_CHAT_SYSTEM_PROMPT: str = ""
+    AI_ANALYSIS_LANGUAGE: str = "Indonesia"
 
     # CORS
     CORS_ORIGINS: str = "http://localhost:3000,http://localhost:3001"

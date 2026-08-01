@@ -17,7 +17,7 @@ from app.models.schemas import (
     ColumnInfo,
 )
 from app.services.dag_generator import generate_dag_id, generate_dag_content, save_dag_file, delete_dag_file
-from app.services.airflow_client import trigger_dag, get_dag_status
+from app.services.airflow_client import trigger_dag, get_dag_status, cancel_dag_run
 from app.services.pipeline_validator import validate_step
 
 logger = logging.getLogger(__name__)
@@ -302,6 +302,57 @@ async def run_pipeline(
         raise HTTPException(status_code=502, detail="Gagal trigger pipeline ke Airflow")
 
     return {"message": f"Pipeline '{pipeline['name']}' triggered", "dag_id": dag_id}
+
+
+@router.post("/{pipeline_id}/cancel")
+async def cancel_pipeline(
+    pipeline_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    pipeline = await _get_pipeline_raw(pipeline_id, db)
+    if not pipeline:
+        raise HTTPException(status_code=404, detail="Pipeline tidak ditemukan")
+
+    if pipeline.get("status") != "running":
+        raise HTTPException(status_code=409, detail="Pipeline tidak sedang berjalan")
+
+    dag_id = pipeline.get("dag_id")
+    if not dag_id:
+        raise HTTPException(status_code=400, detail="Pipeline tidak memiliki DAG")
+
+    # Get latest run_id
+    runs_result = await db.execute(
+        text("SELECT run_id FROM app.pipeline_runs WHERE dag_id = :d AND status = 'running' ORDER BY created_at DESC LIMIT 1"),
+        {"d": dag_id},
+    )
+    row = runs_result.first()
+    run_id = row._mapping.get("run_id") if row else None
+
+    if not run_id:
+        raise HTTPException(status_code=400, detail="Tidak ada run aktif untuk di-cancel")
+
+    try:
+        await cancel_dag_run(dag_id, run_id)
+    except Exception as e:
+        logger.error("Airflow cancel failed for %s: %s", dag_id, e, exc_info=True)
+        raise HTTPException(status_code=502, detail="Gagal cancel pipeline di Airflow")
+
+    await db.execute(
+        text("UPDATE app.pipeline_runs SET status = 'failed' WHERE dag_id = :d AND status = 'running'"),
+        {"d": dag_id},
+    )
+    await db.execute(
+        text("UPDATE app.pipelines SET status = 'failed' WHERE id = :id"),
+        {"id": pipeline_id},
+    )
+    await db.execute(
+        text("INSERT INTO app.activity_log (action, status, user_id) VALUES (:a, 'failed', :u)"),
+        {"a": f"Pipeline '{pipeline['name']}' di-interupsi", "u": current_user["id"]},
+    )
+    await db.commit()
+
+    return {"message": f"Pipeline '{pipeline['name']}' berhasil di-cancel"}
 
 
 @router.get("/{pipeline_id}/status")
