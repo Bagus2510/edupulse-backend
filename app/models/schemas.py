@@ -65,6 +65,7 @@ class DashboardCreate(BaseModel):
     description: str = ""
     superset_uuid: str = ""
     status: str = "pending"
+    domain_id: int | None = None
 
 
 class DashboardResponse(BaseModel):
@@ -74,6 +75,8 @@ class DashboardResponse(BaseModel):
     superset_uuid: str | None
     status: str
     is_default: bool
+    domain_id: int | None = None
+    dependency_count: int = 0
     created_at: str
     updated_at: str
 
@@ -141,6 +144,7 @@ class PipelineCreate(BaseModel):
     max_active_runs: int = 1
     on_failure_callback: str = ""
     schedule_interval: str = ""
+    domain_id: int | None = None
     steps: list[PipelineStepCreate] = []
 
 
@@ -154,6 +158,9 @@ class PipelineResponse(BaseModel):
     max_active_runs: int | None = 1
     on_failure_callback: str | None = ""
     schedule_interval: str | None = ""
+    schedule_description: str = ""
+    is_active: bool = True
+    domain_id: int | None = None
     steps: list[PipelineStepResponse] = []
     created_at: str
     updated_at: str
@@ -166,6 +173,10 @@ class PipelineListResponse(BaseModel):
     status: str
     last_run_at: str | None
     step_count: int
+    schedule_interval: str | None = ""
+    schedule_description: str = ""
+    is_active: bool = True
+    domain_id: int | None = None
     created_at: str
 
 
@@ -180,3 +191,45 @@ class TableInfo(BaseModel):
 class ColumnInfo(BaseModel):
     column_name: str
     data_type: str
+
+
+# Phase 1: Dashboard Dependencies
+class DashboardDependencyCreate(BaseModel):
+    mart_table_name: str
+
+
+class DashboardDependencyResponse(BaseModel):
+    id: int
+    dashboard_id: int
+    mart_table_name: str
+
+
+# Phase 1: Mart Table Metadata
+class MartTableMetadataResponse(BaseModel):
+    id: int
+    table_name: str
+    schema_name: str
+    producing_pipeline_id: int | None = None
+    producing_step_id: int | None = None
+    last_built_at: str | None = None
+    row_count: int = 0
+    column_info: list[dict] = []
+    freshness: str = "never_built"
+
+
+# Phase 3: Domains
+class DomainCreate(BaseModel):
+    name: str
+    description: str = ""
+    icon: str | None = None
+    color: str = "pulse"
+
+
+class DomainResponse(BaseModel):
+    id: int
+    name: str
+    description: str = ""
+    icon: str | None = None
+    color: str = "pulse"
+    pipeline_count: int = 0
+    dashboard_count: int = 0

@@ -72,7 +72,8 @@ async def list_mart_datasets(
         text(
             "SELECT t.table_schema, t.table_name, "
             "COALESCE(pg_stats.n_live_tup, 0) AS row_count, "
-            "COALESCE(col_info.column_count, 0) AS column_count "
+            "COALESCE(col_info.column_count, 0) AS column_count, "
+            "m.last_built_at, m.row_count AS meta_row_count "
             "FROM information_schema.tables t "
             "LEFT JOIN pg_stat_user_tables pg_stats "
             "ON pg_stats.schemaname = t.table_schema AND pg_stats.relname = t.table_name "
@@ -82,21 +83,60 @@ async def list_mart_datasets(
             "  WHERE table_schema = 'mart' "
             "  GROUP BY table_schema, table_name"
             ") col_info ON col_info.table_schema = t.table_schema AND col_info.table_name = t.table_name "
+            "LEFT JOIN app.mart_table_metadata m ON m.table_name = t.table_name "
             "WHERE t.table_schema = 'mart' "
             "ORDER BY t.table_name"
         )
     )
     rows = result.fetchall()
-    return [
-        TableInfo(
-            schema_name=r.table_schema,
-            table_name=r.table_name,
-            full_name=f"{r.table_schema}.{r.table_name}",
-            row_count=r.row_count,
-            column_count=r.column_count,
-        )
-        for r in rows
-    ]
+
+    from app.services.mart_metadata import compute_freshness
+    items = []
+    for r in rows:
+        freshness = compute_freshness(r.last_built_at)
+        items.append({
+            "schema_name": r.table_schema,
+            "table_name": r.table_name,
+            "full_name": f"{r.table_schema}.{r.table_name}",
+            "row_count": r.meta_row_count or r.row_count,
+            "column_count": r.column_count,
+            "last_built_at": str(r.last_built_at) if r.last_built_at else None,
+            "freshness": freshness,
+        })
+    return items
+
+
+@router.get("/mart-tables")
+async def list_mart_table_metadata(
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """List all mart tables with metadata from pipeline tracking."""
+    result = await db.execute(
+        text("""
+            SELECT m.*, p.name AS pipeline_name
+            FROM app.mart_table_metadata m
+            LEFT JOIN app.pipelines p ON m.producing_pipeline_id = p.id
+            ORDER BY m.table_name
+        """)
+    )
+    from app.services.mart_metadata import compute_freshness
+    items = []
+    for r in result.fetchall():
+        freshness = compute_freshness(r.last_built_at)
+        items.append({
+            "id": r.id,
+            "table_name": r.table_name,
+            "schema_name": r.schema_name,
+            "producing_pipeline_id": r.producing_pipeline_id,
+            "producing_step_id": r.producing_step_id,
+            "last_built_at": str(r.last_built_at) if r.last_built_at else None,
+            "row_count": r.row_count,
+            "column_info": r.column_info,
+            "freshness": freshness,
+            "pipeline_name": r.pipeline_name or "",
+        })
+    return items
 
 
 @router.get("/{schema_name}.{table_name}/info")

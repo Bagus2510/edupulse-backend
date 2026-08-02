@@ -19,6 +19,8 @@ from app.models.schemas import (
 from app.services.dag_generator import generate_dag_id, generate_dag_content, save_dag_file, delete_dag_file
 from app.services.airflow_client import trigger_dag, get_dag_status, cancel_dag_run
 from app.services.pipeline_validator import validate_step
+from app.services.cron_parser import cron_to_human, next_run_time
+from app.services.mart_metadata import register_all_mart_tables
 
 logger = logging.getLogger(__name__)
 
@@ -26,9 +28,19 @@ router = APIRouter(prefix="/api/pipelines", tags=["pipelines"])
 
 
 @router.get("", response_model=list[PipelineListResponse])
-async def list_pipelines(db: AsyncSession = Depends(get_db)):
+async def list_pipelines(
+    domain_id: int | None = None,
+    db: AsyncSession = Depends(get_db),
+):
+    where = ""
+    params = {}
+    if domain_id:
+        where = "WHERE p.domain_id = :did"
+        params = {"did": domain_id}
+
     result = await db.execute(
-        text("SELECT p.*, (SELECT COUNT(*) FROM app.pipeline_steps WHERE pipeline_id = p.id) AS step_count FROM app.pipelines p ORDER BY p.created_at DESC")
+        text(f"SELECT p.*, (SELECT COUNT(*) FROM app.pipeline_steps WHERE pipeline_id = p.id) AS step_count FROM app.pipelines p {where} ORDER BY p.created_at DESC"),
+        params,
     )
     rows = result.fetchall()
 
@@ -60,6 +72,10 @@ async def list_pipelines(db: AsyncSession = Depends(get_db)):
             status=r.status,
             last_run_at=str(r.last_run_at) if r.last_run_at else None,
             step_count=r.step_count,
+            schedule_interval=r.schedule_interval or "",
+            schedule_description=cron_to_human(r.schedule_interval or ""),
+            is_active=getattr(r, 'is_active', True),
+            domain_id=getattr(r, 'domain_id', None),
             created_at=str(r.created_at),
         )
         for r in rows
@@ -80,8 +96,8 @@ async def create_pipeline(
     dag_id = generate_dag_id(payload.name)
 
     result = await db.execute(
-        text("INSERT INTO app.pipelines (name, description, created_by, max_active_runs, on_failure_callback, dag_id, schedule_interval) VALUES (:n, :d, :u, :m, :f, :dag, :si) RETURNING id"),
-        {"n": payload.name, "d": payload.description, "u": current_user["id"], "m": payload.max_active_runs, "f": payload.on_failure_callback, "dag": dag_id, "si": payload.schedule_interval},
+        text("INSERT INTO app.pipelines (name, description, created_by, max_active_runs, on_failure_callback, dag_id, schedule_interval, domain_id) VALUES (:n, :d, :u, :m, :f, :dag, :si, :di) RETURNING id"),
+        {"n": payload.name, "d": payload.description, "u": current_user["id"], "m": payload.max_active_runs, "f": payload.on_failure_callback, "dag": dag_id, "si": payload.schedule_interval, "di": payload.domain_id},
     )
     pipeline_id = result.fetchone().id
     await db.commit()
@@ -106,6 +122,9 @@ async def create_pipeline(
         on_failure_callback=payload.on_failure_callback,
     )
     save_dag_file(dag_id, content)
+
+    # Register mart tables in metadata
+    await register_all_mart_tables(db, pipeline_id)
 
     return await _get_pipeline(pipeline_id, db)
 
@@ -172,8 +191,8 @@ async def update_pipeline(
         new_dag_id = old_dag_id
 
     await db.execute(
-        text("UPDATE app.pipelines SET name = :n, description = :d, max_active_runs = :m, on_failure_callback = :f, dag_id = :dag, schedule_interval = :si, status = 'draft', updated_at = NOW() WHERE id = :id"),
-        {"n": payload.name, "d": payload.description, "m": payload.max_active_runs, "f": payload.on_failure_callback, "dag": new_dag_id, "si": payload.schedule_interval, "id": pipeline_id},
+        text("UPDATE app.pipelines SET name = :n, description = :d, max_active_runs = :m, on_failure_callback = :f, dag_id = :dag, schedule_interval = :si, domain_id = :di, status = 'draft', updated_at = NOW() WHERE id = :id"),
+        {"n": payload.name, "d": payload.description, "m": payload.max_active_runs, "f": payload.on_failure_callback, "dag": new_dag_id, "si": payload.schedule_interval, "di": payload.domain_id, "id": pipeline_id},
     )
     await db.execute(text("DELETE FROM app.pipeline_steps WHERE pipeline_id = :id"), {"id": pipeline_id})
     await db.commit()
@@ -202,6 +221,9 @@ async def update_pipeline(
         on_failure_callback=payload.on_failure_callback,
     )
     save_dag_file(new_dag_id, content)
+
+    # Register mart tables in metadata
+    await register_all_mart_tables(db, pipeline_id)
 
     return await _get_pipeline(pipeline_id, db)
 
@@ -406,6 +428,59 @@ async def pipeline_status(pipeline_id: int, db: AsyncSession = Depends(get_db)):
     }
 
 
+@router.patch("/{pipeline_id}/toggle-active")
+async def toggle_pipeline_active(
+    pipeline_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    result = await db.execute(
+        text("UPDATE app.pipelines SET is_active = NOT is_active, updated_at = NOW() WHERE id = :id RETURNING id, is_active"),
+        {"id": pipeline_id},
+    )
+    row = result.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Pipeline tidak ditemukan")
+    await db.commit()
+    return {"message": f"Pipeline {'diaktifkan' if row.is_active else 'dinonaktifkan'}", "is_active": row.is_active}
+
+
+@router.get("/{pipeline_id}/consumers")
+async def pipeline_consumers(pipeline_id: int, db: AsyncSession = Depends(get_db)):
+    """Which dashboards consume this pipeline's mart tables."""
+    result = await db.execute(
+        text("""
+            SELECT DISTINCT d.id, d.title, d.superset_uuid, d.status
+            FROM app.dashboards d
+            JOIN app.dashboard_dependencies dd ON dd.dashboard_id = d.id
+            JOIN app.pipeline_steps ps ON ps.dest_table = dd.mart_table_name
+            WHERE ps.pipeline_id = :pid
+            ORDER BY d.title
+        """),
+        {"pid": pipeline_id},
+    )
+    return [{"id": r.id, "title": r.title, "superset_uuid": r.superset_uuid, "status": r.status} for r in result.fetchall()]
+
+
+@router.get("/{pipeline_id}/next-run")
+async def pipeline_next_run(pipeline_id: int, db: AsyncSession = Depends(get_db)):
+    """Calculate next run time for a scheduled pipeline."""
+    result = await db.execute(
+        text("SELECT schedule_interval FROM app.pipelines WHERE id = :id"),
+        {"id": pipeline_id},
+    )
+    row = result.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Pipeline tidak ditemukan")
+
+    nr = next_run_time(row.schedule_interval)
+    return {
+        "schedule_interval": row.schedule_interval or "",
+        "schedule_description": cron_to_human(row.schedule_interval or ""),
+        "next_run_at": str(nr) if nr else None,
+    }
+
+
 async def _get_pipeline_raw(pipeline_id: int, db: AsyncSession) -> dict | None:
     result = await db.execute(text("SELECT * FROM app.pipelines WHERE id = :id"), {"id": pipeline_id})
     row = result.fetchone()
@@ -448,6 +523,9 @@ async def _get_pipeline(pipeline_id: int, db: AsyncSession) -> PipelineResponse:
         max_active_runs=pipeline.get("max_active_runs", 1),
         on_failure_callback=pipeline.get("on_failure_callback", ""),
         schedule_interval=pipeline.get("schedule_interval", ""),
+        schedule_description=cron_to_human(pipeline.get("schedule_interval", "")),
+        is_active=pipeline.get("is_active", True),
+        domain_id=pipeline.get("domain_id"),
         steps=steps,
         created_at=str(pipeline["created_at"]),
         updated_at=str(pipeline["updated_at"]),
