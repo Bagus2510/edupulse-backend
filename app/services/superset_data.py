@@ -30,6 +30,10 @@ async def _get_edupulse_pool():
 
 async def get_dashboard_charts(dashboard_uuid: str) -> list[dict]:
     """Fetch chart IDs and table info from a dashboard by UUID."""
+    if not dashboard_uuid:
+        logger.warning("get_dashboard_charts called with empty dashboard_uuid")
+        return []
+
     pool = await _get_superset_pool()
     try:
         async with pool.acquire() as conn:
@@ -75,13 +79,46 @@ async def get_dashboard_charts(dashboard_uuid: str) -> list[dict]:
                             """,
                             chart_id,
                         )
-                        charts.append({
-                            "id": chart_id,
-                            "name": meta.get("sliceName", f"Chart {chart_id}"),
-                            "table_name": slice_row["table_name"] if slice_row else None,
-                            "schema": slice_row["schema"] if slice_row else None,
-                        })
+                        if slice_row:
+                            charts.append({
+                                "id": chart_id,
+                                "name": meta.get("sliceName", slice_row["slice_name"] or f"Chart {chart_id}"),
+                                "viz_type": slice_row["viz_type"] or "unknown",
+                                "table_name": slice_row["table_name"],
+                                "schema": slice_row["schema"],
+                            })
+                        else:
+                            # Fallback: try to get table from params JSON
+                            params_row = await conn.fetchrow(
+                                """
+                                SELECT s.slice_name, s.viz_type, s.params
+                                FROM slices s WHERE s.id = $1
+                                """,
+                                chart_id,
+                            )
+                            table_name = None
+                            schema = None
+                            if params_row and params_row["params"]:
+                                try:
+                                    params = json.loads(params_row["params"]) if isinstance(params_row["params"], str) else params_row["params"]
+                                    # Try common Superset param keys
+                                    table_name = params.get("table_name") or params.get("table")
+                                    schema = params.get("schema") or params.get("database_schema")
+                                except (json.JSONDecodeError, TypeError):
+                                    pass
+                            charts.append({
+                                "id": chart_id,
+                                "name": meta.get("sliceName", (params_row["slice_name"] if params_row else None) or f"Chart {chart_id}"),
+                                "viz_type": (params_row["viz_type"] if params_row else None) or "unknown",
+                                "table_name": table_name,
+                                "schema": schema,
+                            })
+
+            logger.info("Found %d charts for dashboard %s", len(charts), dashboard_uuid)
             return charts
+    except Exception as e:
+        logger.error("Error fetching charts for dashboard %s: %s", dashboard_uuid, e)
+        return []
     finally:
         await pool.close()
 
@@ -97,7 +134,7 @@ async def get_chart_data(chart_id: int, table_name: str = None, schema: str = No
             async with spool.acquire() as conn:
                 row = await conn.fetchrow(
                     """
-                    SELECT s.slice_name, s.viz_type,
+                    SELECT s.slice_name, s.viz_type, s.params,
                            t.table_name, t.schema
                     FROM slices s
                     LEFT JOIN tables t ON t.id = (s.query_context::json->'datasource'->>'id')::int
@@ -109,10 +146,19 @@ async def get_chart_data(chart_id: int, table_name: str = None, schema: str = No
                     chart_name = row["slice_name"] or chart_name
                     table_name = row["table_name"]
                     schema = row["schema"]
+                    # Fallback: try params JSON
+                    if not table_name and row["params"]:
+                        try:
+                            params = json.loads(row["params"]) if isinstance(row["params"], str) else row["params"]
+                            table_name = params.get("table_name") or params.get("table")
+                            schema = params.get("schema") or params.get("database_schema")
+                        except (json.JSONDecodeError, TypeError):
+                            pass
         finally:
             await spool.close()
 
     if not table_name:
+        logger.warning("No table_name for chart %d (%s)", chart_id, chart_name)
         return {"id": chart_id, "name": chart_name, "viz_type": "unknown", "data": None}
 
     # Query edupulse DB directly
@@ -120,6 +166,7 @@ async def get_chart_data(chart_id: int, table_name: str = None, schema: str = No
     try:
         async with epool.acquire() as conn:
             query = f'SELECT * FROM "{schema}"."{table_name}" LIMIT 50'
+            logger.info("Querying chart data: %s", query)
             rows = await conn.fetch(query)
             data = [dict(r) for r in rows]
 
@@ -129,6 +176,7 @@ async def get_chart_data(chart_id: int, table_name: str = None, schema: str = No
                     if hasattr(v, 'isoformat'):
                         row[k] = str(v)
 
+            logger.info("Got %d rows for chart %d (%s)", len(data), chart_id, chart_name)
             return {
                 "id": chart_id,
                 "name": chart_name,
@@ -136,7 +184,7 @@ async def get_chart_data(chart_id: int, table_name: str = None, schema: str = No
                 "data": data,
             }
     except Exception as e:
-        logger.error("Failed to query %s.%s: %s", schema, table_name, e)
+        logger.error("Failed to query %s.%s for chart %d: %s", schema, table_name, chart_id, e)
         return {"id": chart_id, "name": chart_name, "viz_type": "unknown", "data": None}
     finally:
         await epool.close()

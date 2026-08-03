@@ -1,3 +1,4 @@
+import json
 import logging
 from typing import Annotated
 
@@ -87,22 +88,27 @@ async def chat_stream_endpoint(request: Request, req: ChatRequest, user: Current
                 dashboard_title=req.dashboard_title,
                 user_id=user["id"],
             ):
-                yield f"data: {chunk.replace(chr(10), '\\n')}\n\n"
+                # JSON menjaga spasi awal token dan newline tetap utuh saat melewati SSE.
+                yield f"data: {json.dumps(str(chunk), ensure_ascii=False)}\n\n"
         except Exception as e:
             logger.error("Stream error: %s", e)
-            yield f"data: Error: Gagal memproses response\n\n"
+            yield f"data: {json.dumps('Error: Gagal memproses response', ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 
 @router.post("/chat/clear")
 async def clear_chat(req: ChatClearRequest, user: CurrentUserDep):
-    clear_chat_history(req.session_id)
+    await clear_chat_history(req.session_id)
     return {"status": "ok", "session_id": req.session_id}
 
 
