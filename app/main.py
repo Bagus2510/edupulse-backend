@@ -7,7 +7,8 @@ from sqlalchemy import text
 from app.core.config import settings
 from app.core.database import check_db_connection, async_session
 from app.core.rate_limit import limiter
-from app.routers import superset, airflow, ai, settings as settings_router, dashboards, activity, pipeline, auth, pipelines, home, datasets, lineage, domains
+from app.routers import superset, airflow, ai, settings as settings_router, dashboards, activity, pipeline, auth, pipelines, home, datasets, lineage, domains, metadata, admin_users
+from app.services.data_quality import backfill_asset_metadata
 
 app = FastAPI(
     title="EduPulse Backend",
@@ -46,6 +47,8 @@ app.include_router(home.router)
 app.include_router(datasets.router)
 app.include_router(lineage.router)
 app.include_router(domains.router)
+app.include_router(metadata.router)
+app.include_router(admin_users.router)
 
 
 @app.on_event("startup")
@@ -54,6 +57,8 @@ async def ensure_schemas():
         await session.execute(text("CREATE SCHEMA IF NOT EXISTS raw"))
         await session.execute(text("CREATE SCHEMA IF NOT EXISTS mart"))
         # Add new columns if they don't exist
+        await session.execute(text("ALTER TABLE app.users DROP CONSTRAINT IF EXISTS users_role_check"))
+        await session.execute(text("ALTER TABLE app.users ADD CONSTRAINT users_role_check CHECK (role IN ('admin', 'editor', 'viewer'))"))
         await session.execute(text("ALTER TABLE app.pipelines ADD COLUMN IF NOT EXISTS max_active_runs INTEGER DEFAULT 1"))
         await session.execute(text("ALTER TABLE app.pipelines ADD COLUMN IF NOT EXISTS on_failure_callback VARCHAR(255) DEFAULT ''"))
         await session.execute(text("ALTER TABLE app.pipelines ADD COLUMN IF NOT EXISTS dag_id TEXT DEFAULT ''"))
@@ -85,6 +90,81 @@ async def ensure_schemas():
                 UNIQUE(dashboard_id, mart_table_name)
             )
         """))
+        # Unified metadata and data-quality plane
+        await session.execute(text("""
+            CREATE TABLE IF NOT EXISTS app.data_assets (
+                id SERIAL PRIMARY KEY,
+                schema_name VARCHAR(50) NOT NULL,
+                table_name VARCHAR(200) NOT NULL,
+                asset_type VARCHAR(20) NOT NULL DEFAULT 'raw',
+                owner_id INTEGER REFERENCES app.users(id) ON DELETE SET NULL,
+                description TEXT DEFAULT '',
+                row_count BIGINT DEFAULT 0,
+                column_count INTEGER DEFAULT 0,
+                last_loaded_at TIMESTAMP,
+                last_built_at TIMESTAMP,
+                freshness_status VARCHAR(20) DEFAULT 'never_built',
+                quality_status VARCHAR(20) DEFAULT 'unknown',
+                quality_score NUMERIC(5,2),
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE(schema_name, table_name)
+            )
+        """))
+        await session.execute(text("""
+            CREATE TABLE IF NOT EXISTS app.data_columns (
+                id SERIAL PRIMARY KEY,
+                asset_id INTEGER REFERENCES app.data_assets(id) ON DELETE CASCADE,
+                column_name VARCHAR(200) NOT NULL,
+                data_type VARCHAR(100) NOT NULL,
+                nullable BOOLEAN DEFAULT true,
+                null_count BIGINT DEFAULT 0,
+                distinct_count BIGINT DEFAULT 0,
+                is_primary_key BOOLEAN DEFAULT false,
+                is_metric BOOLEAN DEFAULT false,
+                description TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE(asset_id, column_name)
+            )
+        """))
+        await session.execute(text("""
+            CREATE TABLE IF NOT EXISTS app.data_quality_results (
+                id SERIAL PRIMARY KEY,
+                asset_id INTEGER REFERENCES app.data_assets(id) ON DELETE CASCADE,
+                check_name VARCHAR(200) NOT NULL,
+                check_type VARCHAR(50) NOT NULL,
+                status VARCHAR(20) NOT NULL,
+                expected_value TEXT,
+                actual_value TEXT,
+                severity VARCHAR(20) DEFAULT 'info',
+                message TEXT NOT NULL,
+                checked_at TIMESTAMP DEFAULT NOW()
+            )
+        """))
+        await session.execute(text("""
+            CREATE TABLE IF NOT EXISTS app.metric_definitions (
+                id SERIAL PRIMARY KEY,
+                name VARCHAR(150) NOT NULL UNIQUE,
+                label VARCHAR(200) NOT NULL,
+                description TEXT DEFAULT '',
+                formula TEXT NOT NULL,
+                source_asset VARCHAR(255) NOT NULL,
+                grain VARCHAR(100) DEFAULT '',
+                unit VARCHAR(50) DEFAULT '',
+                target_value NUMERIC,
+                owner_id INTEGER REFERENCES app.users(id) ON DELETE SET NULL,
+                last_verified_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        """))
+        await session.execute(text("ALTER TABLE app.pipeline_runs ADD COLUMN IF NOT EXISTS rows_read BIGINT DEFAULT 0"))
+        await session.execute(text("ALTER TABLE app.pipeline_runs ADD COLUMN IF NOT EXISTS rows_written BIGINT DEFAULT 0"))
+        await session.execute(text("ALTER TABLE app.pipeline_runs ADD COLUMN IF NOT EXISTS duration_ms BIGINT DEFAULT 0"))
+        await session.execute(text("ALTER TABLE app.pipeline_runs ADD COLUMN IF NOT EXISTS quality_status VARCHAR(20) DEFAULT 'unknown'"))
+        await session.execute(text("ALTER TABLE app.pipeline_runs ADD COLUMN IF NOT EXISTS quality_summary JSONB DEFAULT '{}'::jsonb"))
+        await session.execute(text("ALTER TABLE app.pipeline_runs ADD COLUMN IF NOT EXISTS error_message TEXT DEFAULT ''"))
         # Phase 3: Multi-domain support
         await session.execute(text("""
             CREATE TABLE IF NOT EXISTS app.domains (
@@ -101,6 +181,7 @@ async def ensure_schemas():
         # Phase 4: Pipeline scheduling
         await session.execute(text("ALTER TABLE app.pipelines ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT true"))
         await session.commit()
+        await backfill_asset_metadata(session)
 
 
 @app.get("/api/health")

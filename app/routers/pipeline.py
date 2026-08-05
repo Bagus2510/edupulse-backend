@@ -3,13 +3,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 
 from app.core.database import get_db
+from app.core.security import EditorUserDep, ViewerUserDep
 from app.models.schemas import PipelineTriggerRequest
 
 router = APIRouter(prefix="/api/pipeline", tags=["pipeline"])
 
 
 @router.get("/runs")
-async def list_runs(limit: int = 20, db: AsyncSession = Depends(get_db)):
+async def list_runs(
+    current_user: ViewerUserDep,
+    limit: int = 20,
+    db: AsyncSession = Depends(get_db),
+):
     result = await db.execute(
         text("SELECT * FROM app.pipeline_runs ORDER BY created_at DESC LIMIT :l"),
         {"l": limit},
@@ -31,7 +36,11 @@ async def list_runs(limit: int = 20, db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/status/{dag_id}")
-async def pipeline_status(dag_id: str, db: AsyncSession = Depends(get_db)):
+async def pipeline_status(
+    dag_id: str,
+    current_user: ViewerUserDep,
+    db: AsyncSession = Depends(get_db),
+):
     result = await db.execute(
         text("SELECT * FROM app.pipeline_runs WHERE dag_id = :d ORDER BY created_at DESC LIMIT 1"),
         {"d": dag_id},
@@ -52,7 +61,11 @@ async def pipeline_status(dag_id: str, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/trigger")
-async def trigger_pipeline(payload: PipelineTriggerRequest, db: AsyncSession = Depends(get_db)):
+async def trigger_pipeline(
+    payload: PipelineTriggerRequest,
+    current_user: EditorUserDep,
+    db: AsyncSession = Depends(get_db),
+):
     await db.execute(
         text(
             "INSERT INTO app.pipeline_runs (dag_id, status) VALUES (:d, 'running')"

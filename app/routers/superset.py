@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException
 import logging
 
+from app.core.security import ViewerUserDep
 from app.models.schemas import GuestTokenRequest, GuestTokenResponse
 from app.services.superset_client import get_guest_token
 
@@ -13,7 +14,7 @@ router = APIRouter(
 
 
 @router.post("/guest-token", response_model=GuestTokenResponse)
-async def guest_token(req: GuestTokenRequest):
+async def guest_token(req: GuestTokenRequest, current_user: ViewerUserDep):
     try:
         token = await get_guest_token(req.dashboard_uuid)
         return GuestTokenResponse(

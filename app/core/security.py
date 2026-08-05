@@ -43,10 +43,17 @@ def decode_token(token: str) -> dict:
         )
 
 
+ROLE_LEVELS = {
+    "viewer": 10,
+    "editor": 20,
+    "admin": 30,
+}
+
+
 async def get_current_user(
     token: Annotated[str, Depends(oauth2_scheme)],
     db: Annotated[AsyncSession, Depends(get_db)],
-):
+) -> dict:
     payload = decode_token(token)
     if payload.get("type") != "access":
         raise HTTPException(status_code=401, detail="Token type salah")
@@ -63,3 +70,27 @@ async def get_current_user(
     if not user or not user["is_active"]:
         raise HTTPException(status_code=401, detail="User tidak ditemukan")
     return dict(user)
+
+
+def require_role(minimum_role: str):
+    """Create dependency enforcing viewer < editor < admin hierarchy."""
+    if minimum_role not in ROLE_LEVELS:
+        raise ValueError(f"Unknown role: {minimum_role}")
+
+    async def role_dependency(
+        current_user: Annotated[dict, Depends(get_current_user)],
+    ) -> dict:
+        current_role = current_user.get("role", "viewer")
+        if ROLE_LEVELS.get(current_role, 0) < ROLE_LEVELS[minimum_role]:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Role {minimum_role} diperlukan untuk aksi ini",
+            )
+        return current_user
+
+    return role_dependency
+
+
+ViewerUserDep = Annotated[dict, Depends(require_role("viewer"))]
+EditorUserDep = Annotated[dict, Depends(require_role("editor"))]
+AdminUserDep = Annotated[dict, Depends(require_role("admin"))]

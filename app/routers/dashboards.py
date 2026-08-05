@@ -3,7 +3,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.core.security import get_current_user
+from app.core.security import AdminUserDep, EditorUserDep
 from app.models.schemas import DashboardCreate, DashboardDependencyCreate
 
 router = APIRouter(prefix="/api/dashboards", tags=["dashboards"])
@@ -75,7 +75,11 @@ async def get_dashboard(dashboard_id: int, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("")
-async def create_dashboard(payload: DashboardCreate, db: AsyncSession = Depends(get_db)):
+async def create_dashboard(
+    payload: DashboardCreate,
+    current_user: EditorUserDep,
+    db: AsyncSession = Depends(get_db),
+):
     await db.execute(
         text(
             "INSERT INTO app.dashboards (title, description, superset_uuid, status, domain_id) VALUES (:t, :d, :u, :s, :di)"
@@ -87,7 +91,12 @@ async def create_dashboard(payload: DashboardCreate, db: AsyncSession = Depends(
 
 
 @router.put("/{dashboard_id}")
-async def update_dashboard(dashboard_id: int, payload: DashboardCreate, db: AsyncSession = Depends(get_db)):
+async def update_dashboard(
+    dashboard_id: int,
+    payload: DashboardCreate,
+    current_user: EditorUserDep,
+    db: AsyncSession = Depends(get_db),
+):
     await db.execute(
         text(
             "UPDATE app.dashboards SET title = :t, description = :d, superset_uuid = :u, status = :s, domain_id = :di, updated_at = NOW() WHERE id = :id"
@@ -99,7 +108,11 @@ async def update_dashboard(dashboard_id: int, payload: DashboardCreate, db: Asyn
 
 
 @router.delete("/{dashboard_id}")
-async def delete_dashboard(dashboard_id: int, db: AsyncSession = Depends(get_db)):
+async def delete_dashboard(
+    dashboard_id: int,
+    current_user: AdminUserDep,
+    db: AsyncSession = Depends(get_db),
+):
     await db.execute(text("DELETE FROM app.dashboards WHERE id = :id"), {"id": dashboard_id})
     await db.commit()
     return {"message": "Dashboard deleted"}
@@ -117,7 +130,12 @@ async def list_dependencies(dashboard_id: int, db: AsyncSession = Depends(get_db
 
 
 @router.post("/{dashboard_id}/dependencies")
-async def add_dependency(dashboard_id: int, payload: DashboardDependencyCreate, db: AsyncSession = Depends(get_db)):
+async def add_dependency(
+    dashboard_id: int,
+    payload: DashboardDependencyCreate,
+    current_user: EditorUserDep,
+    db: AsyncSession = Depends(get_db),
+):
     try:
         await db.execute(
             text("INSERT INTO app.dashboard_dependencies (dashboard_id, mart_table_name) VALUES (:did, :mn)"),
@@ -130,7 +148,12 @@ async def add_dependency(dashboard_id: int, payload: DashboardDependencyCreate, 
 
 
 @router.delete("/{dashboard_id}/dependencies/{mart_table}")
-async def remove_dependency(dashboard_id: int, mart_table: str, db: AsyncSession = Depends(get_db)):
+async def remove_dependency(
+    dashboard_id: int,
+    mart_table: str,
+    current_user: EditorUserDep,
+    db: AsyncSession = Depends(get_db),
+):
     await db.execute(
         text("DELETE FROM app.dashboard_dependencies WHERE dashboard_id = :did AND mart_table_name = :mn"),
         {"did": dashboard_id, "mn": mart_table},

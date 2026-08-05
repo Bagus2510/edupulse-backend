@@ -1,7 +1,12 @@
 import json
-from datetime import datetime
+import re
+from datetime import datetime, timezone
+
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.services.data_quality import run_quality_checks, sync_asset_metadata
 
 
 async def upsert_mart_metadata(
@@ -17,6 +22,23 @@ async def upsert_mart_metadata(
     parts = dest_table.split(".", 1)
     schema_name = parts[0] if len(parts) > 1 else "mart"
     table_name = parts[1] if len(parts) > 1 else dest_table
+    if schema_name != "mart" or not re.fullmatch(r"[A-Za-z0-9_]+", table_name):
+        return
+
+    # A pipeline can be saved before Airflow creates its destination table.
+    # Do not create phantom mart metadata or poison the current transaction.
+    exists_result = await db.execute(
+        text("""
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_schema = :schema_name AND table_name = :table_name
+            )
+        """),
+        {"schema_name": schema_name, "table_name": table_name},
+    )
+    if not exists_result.scalar():
+        return
 
     # Get row count
     try:
@@ -24,7 +46,8 @@ async def upsert_mart_metadata(
             text(f'SELECT COUNT(*) FROM "{schema_name}"."{table_name}"')
         )
         row_count = count_result.scalar() or 0
-    except Exception:
+    except SQLAlchemyError:
+        await db.rollback()
         row_count = 0
 
     # Get column info
@@ -37,7 +60,8 @@ async def upsert_mart_metadata(
             {"s": schema_name, "t": table_name},
         )
         column_info = [{"name": r.column_name, "type": r.data_type} for r in col_result.fetchall()]
-    except Exception:
+    except SQLAlchemyError:
+        await db.rollback()
         column_info = []
 
     # Upsert
@@ -56,6 +80,12 @@ async def upsert_mart_metadata(
         {"tn": table_name, "sn": schema_name, "pid": pipeline_id, "sid": step_id, "rc": row_count, "ci": json.dumps(column_info)},
     )
     await db.commit()
+    try:
+        asset_id = await sync_asset_metadata(db, schema_name, table_name, "mart")
+        await run_quality_checks(db, schema_name, table_name, asset_id=asset_id)
+    except SQLAlchemyError:
+        # Metadata registration must not make a successful pipeline fail.
+        await db.rollback()
 
 
 async def register_all_mart_tables(db: AsyncSession, pipeline_id: int):
@@ -72,7 +102,9 @@ def compute_freshness(last_built_at: datetime | None) -> str:
     """Compute freshness status from last_built_at timestamp."""
     if not last_built_at:
         return "never_built"
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
+    if last_built_at.tzinfo is None:
+        now = now.replace(tzinfo=None)
     diff = now - last_built_at
     if diff.total_seconds() < 86400:  # 24 hours
         return "fresh"

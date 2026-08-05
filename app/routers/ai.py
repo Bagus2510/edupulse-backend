@@ -16,7 +16,7 @@ from app.models.schemas import (
 )
 from app.services.gemini_client import analyze_dashboard
 from app.services.ai_chat import (
-    chat, chat_stream, clear_chat_history,
+    chat, chat_stream, get_chat_evidence, clear_chat_history,
     list_sessions, get_session_history, delete_session,
 )
 from app.services.superset_data import get_dashboard_data
@@ -81,6 +81,9 @@ async def chat_endpoint(request: Request, req: ChatRequest, user: CurrentUserDep
 async def chat_stream_endpoint(request: Request, req: ChatRequest, user: CurrentUserDep):
     async def event_generator():
         try:
+            evidence = await get_chat_evidence(req.dashboard_uuid)
+            yield f"event: evidence\ndata: {json.dumps(evidence, ensure_ascii=False)}\n\n"
+
             async for chunk in chat_stream(
                 message=req.message,
                 dashboard_uuid=req.dashboard_uuid,

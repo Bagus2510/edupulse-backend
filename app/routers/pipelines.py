@@ -7,7 +7,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.core.security import get_current_user
+from app.core.security import AdminUserDep, EditorUserDep, get_current_user
 from app.models.schemas import (
     PipelineCreate,
     PipelineListResponse,
@@ -58,6 +58,8 @@ async def list_pipelines(
                         text("UPDATE app.pipelines SET status = :s WHERE id = :id"),
                         {"s": airflow_state, "id": r.id},
                     )
+                    if airflow_state == "success":
+                        await register_all_mart_tables(db, r.id)
                     r.status = airflow_state
             except Exception:
                 pass
@@ -85,8 +87,8 @@ async def list_pipelines(
 @router.post("", response_model=PipelineResponse)
 async def create_pipeline(
     payload: PipelineCreate,
+    current_user: EditorUserDep,
     db: AsyncSession = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
 ):
     for i, step in enumerate(payload.steps, 1):
         err = validate_step(step.model_dump())
@@ -168,8 +170,8 @@ async def get_pipeline(pipeline_id: int, db: AsyncSession = Depends(get_db)):
 async def update_pipeline(
     pipeline_id: int,
     payload: PipelineCreate,
+    current_user: EditorUserDep,
     db: AsyncSession = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
 ):
     for i, step in enumerate(payload.steps, 1):
         err = validate_step(step.model_dump())
@@ -229,7 +231,11 @@ async def update_pipeline(
 
 
 @router.delete("/{pipeline_id}")
-async def delete_pipeline(pipeline_id: int, db: AsyncSession = Depends(get_db)):
+async def delete_pipeline(
+    pipeline_id: int,
+    current_user: AdminUserDep,
+    db: AsyncSession = Depends(get_db),
+):
     result = await db.execute(text("SELECT id, dag_id FROM app.pipelines WHERE id = :id"), {"id": pipeline_id})
     row = result.fetchone()
     if not row:
@@ -248,8 +254,8 @@ async def delete_pipeline(pipeline_id: int, db: AsyncSession = Depends(get_db)):
 @router.post("/{pipeline_id}/run")
 async def run_pipeline(
     pipeline_id: int,
+    current_user: EditorUserDep,
     db: AsyncSession = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
 ):
     pipeline = await _get_pipeline_raw(pipeline_id, db)
     if not pipeline:
@@ -329,8 +335,8 @@ async def run_pipeline(
 @router.post("/{pipeline_id}/cancel")
 async def cancel_pipeline(
     pipeline_id: int,
+    current_user: EditorUserDep,
     db: AsyncSession = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
 ):
     pipeline = await _get_pipeline_raw(pipeline_id, db)
     if not pipeline:
@@ -431,8 +437,8 @@ async def pipeline_status(pipeline_id: int, db: AsyncSession = Depends(get_db)):
 @router.patch("/{pipeline_id}/toggle-active")
 async def toggle_pipeline_active(
     pipeline_id: int,
+    current_user: EditorUserDep,
     db: AsyncSession = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
 ):
     result = await db.execute(
         text("UPDATE app.pipelines SET is_active = NOT is_active, updated_at = NOW() WHERE id = :id RETURNING id, is_active"),

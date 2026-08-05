@@ -10,8 +10,9 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.core.security import get_current_user
+from app.core.security import AdminUserDep, EditorUserDep, get_current_user
 from app.models.schemas import TableInfo
+from app.services.data_quality import inspect_asset_quality, run_quality_checks, sync_asset_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +37,10 @@ async def list_datasets(
         text(
             "SELECT t.table_schema, t.table_name, "
             "COALESCE(pg_stats.n_live_tup, 0) AS row_count, "
-            "COALESCE(col_info.column_count, 0) AS column_count "
+            "COALESCE(col_info.column_count, 0) AS column_count, "
+            "COALESCE(a.quality_status, 'unknown') AS quality_status, "
+            "a.quality_score, COALESCE(a.freshness_status, 'unknown') AS freshness_status, "
+            "a.last_loaded_at, a.last_built_at "
             "FROM information_schema.tables t "
             "LEFT JOIN pg_stat_user_tables pg_stats "
             "ON pg_stats.schemaname = t.table_schema AND pg_stats.relname = t.table_name "
@@ -46,6 +50,7 @@ async def list_datasets(
             "  WHERE table_schema = 'raw' "
             "  GROUP BY table_schema, table_name"
             ") col_info ON col_info.table_schema = t.table_schema AND col_info.table_name = t.table_name "
+            "LEFT JOIN app.data_assets a ON a.schema_name = t.table_schema AND a.table_name = t.table_name "
             "WHERE t.table_schema = 'raw' "
             "ORDER BY t.table_name"
         )
@@ -58,6 +63,11 @@ async def list_datasets(
             full_name=f"{r.table_schema}.{r.table_name}",
             row_count=r.row_count,
             column_count=r.column_count,
+            quality_status=r.quality_status,
+            quality_score=float(r.quality_score) if r.quality_score is not None else None,
+            freshness_status=r.freshness_status,
+            last_loaded_at=str(r.last_loaded_at) if r.last_loaded_at else None,
+            last_built_at=str(r.last_built_at) if r.last_built_at else None,
         )
         for r in rows
     ]
@@ -73,7 +83,10 @@ async def list_mart_datasets(
             "SELECT t.table_schema, t.table_name, "
             "COALESCE(pg_stats.n_live_tup, 0) AS row_count, "
             "COALESCE(col_info.column_count, 0) AS column_count, "
-            "m.last_built_at, m.row_count AS meta_row_count "
+            "m.last_built_at, m.row_count AS meta_row_count, "
+            "COALESCE(a.quality_status, 'unknown') AS quality_status, "
+            "a.quality_score, COALESCE(a.freshness_status, 'unknown') AS freshness_status, "
+            "a.last_loaded_at, a.last_built_at AS asset_last_built_at "
             "FROM information_schema.tables t "
             "LEFT JOIN pg_stat_user_tables pg_stats "
             "ON pg_stats.schemaname = t.table_schema AND pg_stats.relname = t.table_name "
@@ -84,6 +97,7 @@ async def list_mart_datasets(
             "  GROUP BY table_schema, table_name"
             ") col_info ON col_info.table_schema = t.table_schema AND col_info.table_name = t.table_name "
             "LEFT JOIN app.mart_table_metadata m ON m.table_name = t.table_name "
+            "LEFT JOIN app.data_assets a ON a.schema_name = t.table_schema AND a.table_name = t.table_name "
             "WHERE t.table_schema = 'mart' "
             "ORDER BY t.table_name"
         )
@@ -93,17 +107,38 @@ async def list_mart_datasets(
     from app.services.mart_metadata import compute_freshness
     items = []
     for r in rows:
-        freshness = compute_freshness(r.last_built_at)
+        freshness = compute_freshness(r.last_built_at or r.asset_last_built_at)
         items.append({
             "schema_name": r.table_schema,
             "table_name": r.table_name,
             "full_name": f"{r.table_schema}.{r.table_name}",
             "row_count": r.meta_row_count or r.row_count,
             "column_count": r.column_count,
-            "last_built_at": str(r.last_built_at) if r.last_built_at else None,
+            "last_built_at": str(r.last_built_at or r.asset_last_built_at) if (r.last_built_at or r.asset_last_built_at) else None,
             "freshness": freshness,
+            "quality_status": r.quality_status,
+            "quality_score": float(r.quality_score) if r.quality_score is not None else None,
+            "freshness_status": r.freshness_status,
+            "last_loaded_at": str(r.last_loaded_at) if r.last_loaded_at else None,
         })
     return items
+
+
+@router.post("/mart/golden-path/reset")
+async def reset_golden_path_mart(
+    current_user: EditorUserDep,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, str]:
+    """Reset only the portfolio demo mart before a repeatable run."""
+    await db.execute(text('DROP TABLE IF EXISTS "mart"."golden_path_summary"'))
+    await db.execute(
+        text("DELETE FROM app.mart_table_metadata WHERE schema_name = 'mart' AND table_name = 'golden_path_summary'")
+    )
+    await db.execute(
+        text("DELETE FROM app.data_assets WHERE schema_name = 'mart' AND table_name = 'golden_path_summary'")
+    )
+    await db.commit()
+    return {"message": "Golden Path mart di-reset"}
 
 
 @router.get("/mart-tables")
@@ -172,9 +207,9 @@ async def table_info(
 
 @router.post("/upload")
 async def upload_dataset(
+    current_user: EditorUserDep,
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
 ):
     ext = "." + file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else ""
     if ext not in ALLOWED_EXTENSIONS:
@@ -214,6 +249,14 @@ async def upload_dataset(
             )
 
         await db.commit()
+        asset_id = await sync_asset_metadata(
+            db,
+            schema_name="raw",
+            table_name=table_name,
+            asset_type="raw",
+            owner_id=current_user["id"],
+        )
+        quality = await run_quality_checks(db, "raw", table_name, asset_id=asset_id)
     except HTTPException:
         raise
     except Exception as e:
@@ -226,15 +269,50 @@ async def upload_dataset(
         "table": f"raw.{table_name}",
         "rows": len(df),
         "columns": len(df.columns),
+        "quality": quality,
     }
+
+
+@router.get("/{schema_name}.{table_name}/quality")
+async def asset_quality(
+    schema_name: Annotated[str, Path(description="Schema name (raw or mart)")],
+    table_name: Annotated[str, Path(description="Table name")],
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    if schema_name not in ("raw", "mart"):
+        raise HTTPException(status_code=400, detail="Hanya schema raw/mart yang didukung")
+    result = await inspect_asset_quality(db, schema_name, table_name)
+    if not result:
+        raise HTTPException(status_code=404, detail="Metadata asset belum tersedia")
+    return result
+
+
+@router.post("/{schema_name}.{table_name}/quality/run")
+async def rerun_asset_quality(
+    schema_name: Annotated[str, Path(description="Schema name (raw or mart)")],
+    table_name: Annotated[str, Path(description="Table name")],
+    current_user: EditorUserDep,
+    db: AsyncSession = Depends(get_db),
+):
+    if schema_name not in ("raw", "mart"):
+        raise HTTPException(status_code=400, detail="Hanya schema raw/mart yang didukung")
+    result = await db.execute(
+        text("SELECT id FROM app.data_assets WHERE schema_name = :schema_name AND table_name = :table_name"),
+        {"schema_name": schema_name, "table_name": table_name},
+    )
+    asset_id = result.scalar_one_or_none()
+    if asset_id is None:
+        asset_id = await sync_asset_metadata(db, schema_name, table_name, "raw" if schema_name == "raw" else "mart", current_user["id"])
+    return await run_quality_checks(db, schema_name, table_name, asset_id=asset_id)
 
 
 @router.delete("/{schema_name}.{table_name}")
 async def delete_dataset(
     schema_name: Annotated[str, Path(description="Schema name (raw or mart)")],
     table_name: Annotated[str, Path(description="Table name")],
+    current_user: AdminUserDep,
     db: AsyncSession = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
 ):
     if schema_name not in ("raw", "mart"):
         raise HTTPException(status_code=400, detail="Hanya schema raw/mart yang boleh dihapus")

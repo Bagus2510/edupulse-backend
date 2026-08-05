@@ -186,6 +186,11 @@ class TableInfo(BaseModel):
     full_name: str
     row_count: int = 0
     column_count: int = 0
+    quality_status: str = "unknown"
+    quality_score: float | None = None
+    freshness_status: str = "unknown"
+    last_loaded_at: str | None = None
+    last_built_at: str | None = None
 
 
 class ColumnInfo(BaseModel):

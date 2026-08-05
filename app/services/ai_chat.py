@@ -260,6 +260,50 @@ def _format_chart_data(charts: list[dict]) -> str:
     return "\n".join(parts)
 
 
+async def get_chat_evidence(dashboard_uuid: str) -> dict:
+    """Build explainability metadata from the same chart context used by chat."""
+    chart_context = await _get_chart_context(dashboard_uuid)
+    charts = _chart_cache.get(dashboard_uuid, []) if dashboard_uuid else []
+    source_charts = []
+    total_rows = 0
+    charts_with_data = 0
+
+    for chart in charts:
+        data = chart.get("data") or []
+        rows = len(data)
+        total_rows += rows
+        if rows:
+            charts_with_data += 1
+        source_charts.append({
+            "name": chart.get("name", "Unknown"),
+            "viz_type": chart.get("viz_type", "unknown"),
+            "rows": rows,
+        })
+
+    chart_count = len(source_charts)
+    coverage = f"{charts_with_data}/{chart_count} chart memiliki data" if chart_count else "0 chart berhasil dibaca"
+    limitations = []
+    if not chart_count:
+        limitations.append("Tidak ada chart yang berhasil dibaca dari dashboard.")
+    if chart_count and charts_with_data < chart_count:
+        limitations.append("Sebagian chart tidak memiliki data atau gagal diambil.")
+    if total_rows:
+        limitations.append("Data context AI menggunakan maksimal 10 baris sample per chart.")
+    if not limitations:
+        limitations.append("Belum ada limitation tambahan yang terdeteksi.")
+
+    return {
+        "dashboard_uuid": dashboard_uuid,
+        "source_charts": source_charts,
+        "data_coverage": coverage,
+        "total_rows_available": total_rows,
+        "confidence": 0.9 if charts_with_data == chart_count and chart_count > 0 else 0.35 if chart_count else 0.1,
+        "limitations": limitations,
+        "lineage_url": "/lineage",
+        "context_status": "ready" if chart_context and charts_with_data else "limited",
+    }
+
+
 async def _get_chart_context(dashboard_uuid: str) -> str:
     """Get formatted chart data for a dashboard."""
     if not dashboard_uuid:
