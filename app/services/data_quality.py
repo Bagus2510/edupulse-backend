@@ -199,6 +199,164 @@ async def run_quality_checks(
                 "message": f"Kolom {name} memiliki null rate {null_rate:.1%}.",
             })
 
+    # --- Custom quality rules ---
+    import json
+    rules_result = await db.execute(
+        text("SELECT * FROM app.quality_rules WHERE asset_id = :asset_id AND enabled = true"),
+        {"asset_id": asset_id},
+    )
+    for rule in rules_result.fetchall():
+        rule_dict = dict(rule._mapping)
+        rule_type = rule_dict["rule_type"]
+        col_name = rule_dict.get("column_name")
+        params = rule_dict.get("parameters") or {}
+        if isinstance(params, str):
+            params = json.loads(params)
+        severity = rule_dict.get("severity", "medium")
+
+        try:
+            if rule_type == "not_null" and col_name:
+                quoted_col = _quote_identifier(col_name)
+                null_ct = int(await db.scalar(text(
+                    f"SELECT COUNT(*) FROM {table_identifier} WHERE {quoted_col} IS NULL"
+                )) or 0)
+                status = "passed" if null_ct == 0 else "failed"
+                checks.append({
+                    "check_name": f"{col_name}_not_null",
+                    "check_type": "not_null",
+                    "status": status,
+                    "expected_value": "0",
+                    "actual_value": str(null_ct),
+                    "severity": severity if status == "failed" else "info",
+                    "message": f"Kolom {col_name} memiliki {null_ct} null values." if status == "failed" else f"Kolom {col_name} tidak memiliki null.",
+                })
+
+            elif rule_type == "unique" and col_name:
+                quoted_col = _quote_identifier(col_name)
+                dup_ct = int(await db.scalar(text(
+                    f"SELECT COUNT(*) FROM (SELECT {quoted_col} FROM {table_identifier} GROUP BY {quoted_col} HAVING COUNT(*) > 1) d"
+                )) or 0)
+                status = "passed" if dup_ct == 0 else "failed"
+                checks.append({
+                    "check_name": f"{col_name}_unique",
+                    "check_type": "unique",
+                    "status": status,
+                    "expected_value": "0 duplicates",
+                    "actual_value": str(dup_ct),
+                    "severity": severity if status == "failed" else "info",
+                    "message": f"Kolom {col_name} memiliki {dup_ct} nilai duplikat." if status == "failed" else f"Kolom {col_name} semua nilai unik.",
+                })
+
+            elif rule_type == "accepted_values" and col_name:
+                allowed = params.get("values", [])
+                if allowed:
+                    quoted_col = _quote_identifier(col_name)
+                    placeholders = ", ".join(f"'{v}'" for v in allowed)
+                    invalid_ct = int(await db.scalar(text(
+                        f"SELECT COUNT(*) FROM {table_identifier} WHERE {quoted_col} IS NOT NULL AND {quoted_col} NOT IN ({placeholders})"
+                    )) or 0)
+                    status = "passed" if invalid_ct == 0 else "failed"
+                    checks.append({
+                        "check_name": f"{col_name}_accepted_values",
+                        "check_type": "accepted_values",
+                        "status": status,
+                        "expected_value": str(allowed),
+                        "actual_value": str(invalid_ct) + " invalid",
+                        "severity": severity if status == "failed" else "info",
+                        "message": f"Kolom {col_name} memiliki {invalid_ct} nilai di luar yang diizinkan." if status == "failed" else f"Kolom {col_name} semua nilai valid.",
+                    })
+
+            elif rule_type == "min_value" and col_name:
+                min_val = params.get("value", 0)
+                quoted_col = _quote_identifier(col_name)
+                below_ct = int(await db.scalar(text(
+                    f"SELECT COUNT(*) FROM {table_identifier} WHERE {quoted_col} IS NOT NULL AND {quoted_col} < {min_val}"
+                )) or 0)
+                status = "passed" if below_ct == 0 else "failed"
+                checks.append({
+                    "check_name": f"{col_name}_min_value",
+                    "check_type": "min_value",
+                    "status": status,
+                    "expected_value": f">= {min_val}",
+                    "actual_value": str(below_ct) + " below",
+                    "severity": severity if status == "failed" else "info",
+                    "message": f"Kolom {col_name} memiliki {below_ct} nilai di bawah {min_val}." if status == "failed" else f"Kolom {col_name} semua nilai >= {min_val}.",
+                })
+
+            elif rule_type == "max_value" and col_name:
+                max_val = params.get("value", 0)
+                quoted_col = _quote_identifier(col_name)
+                above_ct = int(await db.scalar(text(
+                    f"SELECT COUNT(*) FROM {table_identifier} WHERE {quoted_col} IS NOT NULL AND {quoted_col} > {max_val}"
+                )) or 0)
+                status = "passed" if above_ct == 0 else "failed"
+                checks.append({
+                    "check_name": f"{col_name}_max_value",
+                    "check_type": "max_value",
+                    "status": status,
+                    "expected_value": f"<= {max_val}",
+                    "actual_value": str(above_ct) + " above",
+                    "severity": severity if status == "failed" else "info",
+                    "message": f"Kolom {col_name} memiliki {above_ct} nilai di atas {max_val}." if status == "failed" else f"Kolom {col_name} semua nilai <= {max_val}.",
+                })
+
+            elif rule_type == "row_count_min":
+                min_rows = params.get("value", 1)
+                status = "passed" if row_count >= min_rows else "failed"
+                checks.append({
+                    "check_name": "row_count_min",
+                    "check_type": "row_count_min",
+                    "status": status,
+                    "expected_value": f">= {min_rows}",
+                    "actual_value": str(row_count),
+                    "severity": severity if status == "failed" else "info",
+                    "message": f"Row count {row_count} {'<' if status == 'failed' else '>='} minimum {min_rows}.",
+                })
+
+            elif rule_type == "freshness_sla":
+                max_age_hours = params.get("max_age_hours", 24)
+                fresh_result = await db.execute(
+                    text("SELECT last_loaded_at, last_built_at FROM app.data_assets WHERE id = :asset_id"),
+                    {"asset_id": asset_id},
+                )
+                fresh_row = fresh_result.fetchone()
+                last_ts = fresh_row.last_loaded_at or fresh_row.last_built_at if fresh_row else None
+                if last_ts:
+                    from datetime import datetime, timezone
+                    age_hours = (datetime.now(timezone.utc) - last_ts.replace(tzinfo=timezone.utc)).total_seconds() / 3600
+                    status = "passed" if age_hours <= max_age_hours else "warning"
+                    checks.append({
+                        "check_name": "freshness_sla",
+                        "check_type": "freshness_sla",
+                        "status": status,
+                        "expected_value": f"<= {max_age_hours}h",
+                        "actual_value": f"{age_hours:.1f}h",
+                        "severity": severity if status == "warning" else "info",
+                        "message": f"Data berusia {age_hours:.1f} jam (SLA: {max_age_hours}h).",
+                    })
+                else:
+                    checks.append({
+                        "check_name": "freshness_sla",
+                        "check_type": "freshness_sla",
+                        "status": "warning",
+                        "expected_value": f"<= {max_age_hours}h",
+                        "actual_value": "unknown",
+                        "severity": severity,
+                        "message": "Timestamp freshness tidak tersedia.",
+                    })
+
+        except Exception as e:
+            logger.warning("Custom rule %s failed: %s", rule_type, e)
+            checks.append({
+                "check_name": f"{rule_type}_error",
+                "check_type": rule_type,
+                "status": "failed",
+                "expected_value": rule_type,
+                "actual_value": "error",
+                "severity": "high",
+                "message": f"Rule {rule_type} gagal dijalankan: {e}",
+            })
+
     await db.execute(text("DELETE FROM app.data_quality_results WHERE asset_id = :asset_id"), {"asset_id": asset_id})
     for check in checks:
         await db.execute(

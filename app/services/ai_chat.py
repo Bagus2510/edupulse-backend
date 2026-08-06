@@ -105,15 +105,22 @@ async def ensure_session(
         await pool.close()
 
 
-async def _save_message(session_id: str, role: str, content: str) -> None:
-    """Save a message to DB."""
+async def _save_message(session_id: str, role: str, content: str, evidence: dict | None = None) -> None:
+    """Save a message to DB, optionally with evidence JSON."""
     pool = await _get_db()
     try:
         async with pool.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO app.chat_messages (session_id, role, content) VALUES ($1, $2, $3)",
-                session_id, role, content,
-            )
+            if evidence is not None:
+                import json
+                await conn.execute(
+                    "INSERT INTO app.chat_messages (session_id, role, content, evidence) VALUES ($1, $2, $3, $4::jsonb)",
+                    session_id, role, content, json.dumps(evidence),
+                )
+            else:
+                await conn.execute(
+                    "INSERT INTO app.chat_messages (session_id, role, content) VALUES ($1, $2, $3)",
+                    session_id, role, content,
+                )
             await conn.execute(
                 "UPDATE app.chat_sessions SET updated_at = NOW() WHERE session_id = $1",
                 session_id,
@@ -181,16 +188,24 @@ async def list_sessions(dashboard_uuid: str | None = None) -> list[dict]:
 
 
 async def get_session_history(session_id: str) -> list[dict]:
-    """Get messages for a session."""
+    """Get messages for a session, including persisted evidence."""
     pool = await _get_db()
     try:
         async with pool.acquire() as conn:
             rows = await conn.fetch(
-                """SELECT role, content, created_at FROM app.chat_messages
+                """SELECT role, content, evidence, created_at FROM app.chat_messages
                    WHERE session_id = $1 ORDER BY created_at ASC""",
                 session_id,
             )
-            return [{"role": r["role"], "content": r["content"], "timestamp": str(r["created_at"])} for r in rows]
+            result = []
+            for r in rows:
+                item = {"role": r["role"], "content": r["content"], "timestamp": str(r["created_at"])}
+                ev = r["evidence"]
+                if ev is not None:
+                    import json
+                    item["evidence"] = json.loads(ev) if isinstance(ev, str) else dict(ev)
+                result.append(item)
+            return result
     finally:
         await pool.close()
 
@@ -357,8 +372,9 @@ async def chat(
     session_id: str,
     dashboard_title: str = "",
     user_id: int | None = None,
+    evidence: dict | None = None,
 ) -> str:
-    """Process a chat message with conversational memory."""
+    """Process a chat message with conversational memory. Optionally persist evidence."""
     await ensure_session(session_id, user_id=user_id, dashboard_uuid=dashboard_uuid, dashboard_title=dashboard_title)
 
     llm = _get_llm()
@@ -388,7 +404,7 @@ async def chat(
     })
 
     history.add_ai_message(response.content)
-    await _save_message(session_id, "assistant", response.content)
+    await _save_message(session_id, "assistant", response.content, evidence=evidence)
 
     return response.content
 
@@ -399,8 +415,9 @@ async def chat_stream(
     session_id: str,
     dashboard_title: str = "",
     user_id: int | None = None,
+    evidence: dict | None = None,
 ) -> AsyncGenerator[str, None]:
-    """Stream chat response chunk by chunk."""
+    """Stream chat response chunk by chunk. Optionally persist evidence with the assistant message."""
     await ensure_session(session_id, user_id=user_id, dashboard_uuid=dashboard_uuid, dashboard_title=dashboard_title)
 
     llm = _get_llm()
@@ -441,4 +458,4 @@ async def chat_stream(
         yield error_msg
 
     history.add_ai_message(full_response)
-    await _save_message(session_id, "assistant", full_response)
+    await _save_message(session_id, "assistant", full_response, evidence=evidence)

@@ -61,12 +61,14 @@ async def analyze(request: Request, req: AnalyzeRequest, user: CurrentUserDep):
 @limiter.limit("20/minute")
 async def chat_endpoint(request: Request, req: ChatRequest, user: CurrentUserDep):
     try:
+        evidence = await get_chat_evidence(req.dashboard_uuid)
         response = await chat(
             message=req.message,
             dashboard_uuid=req.dashboard_uuid,
             session_id=req.session_id,
             dashboard_title=req.dashboard_title,
             user_id=user["id"],
+            evidence=evidence,
         )
         return ChatResponse(response=response, session_id=req.session_id)
     except HTTPException:
@@ -90,6 +92,7 @@ async def chat_stream_endpoint(request: Request, req: ChatRequest, user: Current
                 session_id=req.session_id,
                 dashboard_title=req.dashboard_title,
                 user_id=user["id"],
+                evidence=evidence,
             ):
                 # JSON menjaga spasi awal token dan newline tetap utuh saat melewati SSE.
                 yield f"data: {json.dumps(str(chunk), ensure_ascii=False)}\n\n"

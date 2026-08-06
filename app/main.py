@@ -7,7 +7,7 @@ from sqlalchemy import text
 from app.core.config import settings
 from app.core.database import check_db_connection, async_session
 from app.core.rate_limit import limiter
-from app.routers import superset, airflow, ai, settings as settings_router, dashboards, activity, pipeline, auth, pipelines, home, datasets, lineage, domains, metadata, admin_users
+from app.routers import superset, airflow, ai, settings as settings_router, dashboards, activity, pipeline, auth, pipelines, home, datasets, lineage, domains, metadata, admin_users, quality_rules
 from app.services.data_quality import backfill_asset_metadata
 
 app = FastAPI(
@@ -49,6 +49,7 @@ app.include_router(lineage.router)
 app.include_router(domains.router)
 app.include_router(metadata.router)
 app.include_router(admin_users.router)
+app.include_router(quality_rules.router)
 
 
 @app.on_event("startup")
@@ -180,6 +181,22 @@ async def ensure_schemas():
         await session.execute(text("ALTER TABLE app.dashboards ADD COLUMN IF NOT EXISTS domain_id INTEGER REFERENCES app.domains(id)"))
         # Phase 4: Pipeline scheduling
         await session.execute(text("ALTER TABLE app.pipelines ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT true"))
+        # Phase 5: Configurable quality rules
+        await session.execute(text("""
+            CREATE TABLE IF NOT EXISTS app.quality_rules (
+                id SERIAL PRIMARY KEY,
+                asset_id INTEGER REFERENCES app.data_assets(id) ON DELETE CASCADE,
+                rule_type VARCHAR(50) NOT NULL,
+                column_name VARCHAR(200),
+                parameters JSONB DEFAULT '{}'::jsonb,
+                severity VARCHAR(20) DEFAULT 'medium',
+                enabled BOOLEAN DEFAULT true,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        """))
+        # Phase 6: Persist AI evidence
+        await session.execute(text("ALTER TABLE app.chat_messages ADD COLUMN IF NOT EXISTS evidence JSONB DEFAULT NULL"))
         await session.commit()
         await backfill_asset_metadata(session)
 

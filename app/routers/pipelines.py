@@ -66,6 +66,31 @@ async def list_pipelines(
 
     await db.commit()
 
+    # Fetch latest run instrumentation for each pipeline
+    pipeline_ids = [r.id for r in rows]
+    instrumentation = {}
+    if pipeline_ids:
+        placeholders = ", ".join(f":p{i}" for i in range(len(pipeline_ids)))
+        params = {f"p{i}": pid for i, pid in enumerate(pipeline_ids)}
+        runs_result = await db.execute(
+            text(f"""
+                SELECT DISTINCT ON (pr.dag_id)
+                    pr.dag_id, pr.rows_read, pr.rows_written, pr.duration_ms, pr.quality_status
+                FROM app.pipeline_runs pr
+                JOIN app.pipelines p ON p.dag_id = pr.dag_id
+                WHERE p.id IN ({placeholders})
+                ORDER BY pr.dag_id, pr.created_at DESC
+            """),
+            params,
+        )
+        for run in runs_result.fetchall():
+            instrumentation[run.dag_id] = {
+                "rows_read": getattr(run, "rows_read", None),
+                "rows_written": getattr(run, "rows_written", None),
+                "duration_ms": getattr(run, "duration_ms", None),
+                "quality_status": getattr(run, "quality_status", None),
+            }
+
     return [
         PipelineListResponse(
             id=r.id,
@@ -79,6 +104,7 @@ async def list_pipelines(
             is_active=getattr(r, 'is_active', True),
             domain_id=getattr(r, 'domain_id', None),
             created_at=str(r.created_at),
+            **instrumentation.get(r.dag_id, {}),
         )
         for r in rows
     ]
@@ -430,8 +456,53 @@ async def pipeline_status(pipeline_id: int, db: AsyncSession = Depends(get_db)):
         "status": airflow_state or run.status,
         "tasks_total": tasks_total,
         "tasks_completed": tasks_completed,
+        "rows_read": getattr(run, "rows_read", None),
+        "rows_written": getattr(run, "rows_written", None),
+        "duration_ms": getattr(run, "duration_ms", None),
+        "quality_status": getattr(run, "quality_status", None),
+        "quality_summary": getattr(run, "quality_summary", None),
+        "error_message": getattr(run, "error_message", None),
         "created_at": str(run.created_at),
     }
+
+
+@router.get("/{pipeline_id}/runs")
+async def list_pipeline_runs(
+    pipeline_id: int,
+    limit: int = 20,
+    db: AsyncSession = Depends(get_db),
+):
+    pipeline = await _get_pipeline_raw(pipeline_id, db)
+    if not pipeline:
+        raise HTTPException(status_code=404, detail="Pipeline tidak ditemukan")
+    dag_id = pipeline.get("dag_id", "")
+    if not dag_id:
+        return []
+    result = await db.execute(
+        text("SELECT * FROM app.pipeline_runs WHERE dag_id = :d ORDER BY created_at DESC LIMIT :l"),
+        {"d": dag_id, "l": limit},
+    )
+    rows = result.fetchall()
+    return [
+        {
+            "id": r.id,
+            "dag_id": r.dag_id,
+            "run_id": r.run_id,
+            "status": r.status,
+            "duration": r.duration,
+            "duration_ms": getattr(r, "duration_ms", None),
+            "tasks_total": r.tasks_total,
+            "tasks_completed": r.tasks_completed,
+            "rows_read": getattr(r, "rows_read", None),
+            "rows_written": getattr(r, "rows_written", None),
+            "quality_status": getattr(r, "quality_status", None),
+            "quality_summary": getattr(r, "quality_summary", None),
+            "error_message": getattr(r, "error_message", None),
+            "triggered_by": getattr(r, "triggered_by", None),
+            "created_at": str(r.created_at),
+        }
+        for r in rows
+    ]
 
 
 @router.patch("/{pipeline_id}/toggle-active")

@@ -136,6 +136,23 @@ async def add_dependency(
     current_user: EditorUserDep,
     db: AsyncSession = Depends(get_db),
 ):
+    # Validate that mart_table_name exists in pipeline_steps
+    validation = await db.execute(
+        text("""
+            SELECT ps.dest_table, p.name AS pipeline_name, p.status AS pipeline_status
+            FROM app.pipeline_steps ps
+            JOIN app.pipelines p ON p.id = ps.pipeline_id
+            WHERE ps.dest_table = :mn
+        """),
+        {"mn": payload.mart_table_name},
+    )
+    valid_table = validation.fetchone()
+    if not valid_table:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Tabel '{payload.mart_table_name}' tidak ditemukan sebagai dest_table di pipeline manapun. Pastikan pipeline yang menghasilkan tabel ini sudah dibuat."
+        )
+
     try:
         await db.execute(
             text("INSERT INTO app.dashboard_dependencies (dashboard_id, mart_table_name) VALUES (:did, :mn)"),
@@ -144,7 +161,7 @@ async def add_dependency(
         await db.commit()
     except Exception:
         raise HTTPException(status_code=409, detail="Dependensi sudah ada")
-    return {"message": "Dependensi ditambahkan"}
+    return {"message": "Dependensi ditambahkan", "valid": True, "pipeline": valid_table.pipeline_name}
 
 
 @router.delete("/{dashboard_id}/dependencies/{mart_table}")
@@ -160,6 +177,61 @@ async def remove_dependency(
     )
     await db.commit()
     return {"message": "Dependensi dihapus"}
+
+
+@router.get("/{dashboard_id}/dependencies/validate")
+async def validate_dependencies(dashboard_id: int, db: AsyncSession = Depends(get_db)):
+    """Validate all dependencies for a dashboard and return validation status."""
+    result = await db.execute(
+        text("SELECT * FROM app.dashboard_dependencies WHERE dashboard_id = :did ORDER BY mart_table_name"),
+        {"did": dashboard_id},
+    )
+    deps = result.fetchall()
+
+    if not deps:
+        return {"valid": True, "total": 0, "valid_count": 0, "invalid_count": 0, "details": []}
+
+    details = []
+    valid_count = 0
+    invalid_count = 0
+
+    for dep in deps:
+        validation = await db.execute(
+            text("""
+                SELECT ps.dest_table, p.name AS pipeline_name, p.status AS pipeline_status
+                FROM app.pipeline_steps ps
+                JOIN app.pipelines p ON p.id = ps.pipeline_id
+                WHERE ps.dest_table = :mn
+            """),
+            {"mn": dep.mart_table_name},
+        )
+        valid_table = validation.fetchone()
+
+        if valid_table:
+            valid_count += 1
+            details.append({
+                "mart_table_name": dep.mart_table_name,
+                "valid": True,
+                "pipeline_name": valid_table.pipeline_name,
+                "pipeline_status": valid_table.pipeline_status,
+            })
+        else:
+            invalid_count += 1
+            details.append({
+                "mart_table_name": dep.mart_table_name,
+                "valid": False,
+                "pipeline_name": None,
+                "pipeline_status": None,
+                "error": "Tabel tidak ditemukan di pipeline manapun",
+            })
+
+    return {
+        "valid": invalid_count == 0,
+        "total": len(deps),
+        "valid_count": valid_count,
+        "invalid_count": invalid_count,
+        "details": details,
+    }
 
 
 # --- Pipeline consumers for a dashboard ---

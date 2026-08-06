@@ -27,8 +27,15 @@ async def list_runs(
             "run_id": r.run_id,
             "status": r.status,
             "duration": r.duration,
+            "duration_ms": getattr(r, "duration_ms", None),
             "tasks_total": r.tasks_total,
             "tasks_completed": r.tasks_completed,
+            "rows_read": getattr(r, "rows_read", None),
+            "rows_written": getattr(r, "rows_written", None),
+            "quality_status": getattr(r, "quality_status", None),
+            "quality_summary": getattr(r, "quality_summary", None),
+            "error_message": getattr(r, "error_message", None),
+            "triggered_by": getattr(r, "triggered_by", None),
             "created_at": str(r.created_at),
         }
         for r in rows
@@ -54,8 +61,15 @@ async def pipeline_status(
         "run_id": r.run_id,
         "status": r.status,
         "duration": r.duration,
+        "duration_ms": getattr(r, "duration_ms", None),
         "tasks_total": r.tasks_total,
         "tasks_completed": r.tasks_completed,
+        "rows_read": getattr(r, "rows_read", None),
+        "rows_written": getattr(r, "rows_written", None),
+        "quality_status": getattr(r, "quality_status", None),
+        "quality_summary": getattr(r, "quality_summary", None),
+        "error_message": getattr(r, "error_message", None),
+        "triggered_by": getattr(r, "triggered_by", None),
         "created_at": str(r.created_at),
     }
 

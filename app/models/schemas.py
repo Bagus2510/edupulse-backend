@@ -103,8 +103,15 @@ class PipelineRunResponse(BaseModel):
     run_id: str | None
     status: str
     duration: str | None
+    duration_ms: int | None = None
     tasks_total: int | None
     tasks_completed: int | None
+    rows_read: int | None = None
+    rows_written: int | None = None
+    quality_status: str | None = None
+    quality_summary: dict | None = None
+    error_message: str | None = None
+    triggered_by: int | None = None
     created_at: str
 
 
@@ -178,6 +185,10 @@ class PipelineListResponse(BaseModel):
     is_active: bool = True
     domain_id: int | None = None
     created_at: str
+    rows_read: int | None = None
+    rows_written: int | None = None
+    duration_ms: int | None = None
+    quality_status: str | None = None
 
 
 class TableInfo(BaseModel):
