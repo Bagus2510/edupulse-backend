@@ -233,6 +233,16 @@ backend/
 | PUT | `/api/admin/users/{id}` | Admin | Update user |
 | DELETE | `/api/admin/users/{id}` | Admin | Delete user |
 
+### Home
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| GET | `/api/home/stats` | Viewer+ | Dashboard stats (pipeline, dashboard, domain count, domain list) |
+
+### Lineage
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| GET | `/api/lineage` | Viewer+ | Data lineage graph (validates mart tables exist) |
+
 ---
 
 ## 👥 RBAC (Role-Based Access Control)
