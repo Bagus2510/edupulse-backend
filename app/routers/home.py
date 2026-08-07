@@ -20,6 +20,9 @@ async def home_summary(db: AsyncSession = Depends(get_db)):
     dashboard_count = await db.execute(text("SELECT COUNT(*) FROM app.dashboards"))
     dashboard_total = dashboard_count.scalar() or 0
 
+    domain_count = await db.execute(text("SELECT COUNT(*) FROM app.domains"))
+    domain_total = domain_count.scalar() or 0
+
 
 
     success_runs = await db.execute(
@@ -148,6 +151,7 @@ async def home_summary(db: AsyncSession = Depends(get_db)):
             "pipelines": {"value": pipeline_total, "label": "Pipeline"},
             "active": {"value": pipeline_active, "label": "Sedang Berjalan"},
             "dashboards": {"value": dashboard_total, "label": "Dashboard"},
+            "domains": {"value": domain_total, "label": "Domain"},
             "success_rate": {"value": f"{success_rate}%", "label": "Tingkat Keberhasilan"},
         },
         "activities": activities,

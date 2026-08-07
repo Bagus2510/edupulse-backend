@@ -18,6 +18,12 @@ async def get_lineage(
     nodes = []
     edges = []
 
+    # Check which mart tables actually exist (used for filtering)
+    existing_mart_tables_result = await db.execute(
+        text("SELECT table_name FROM information_schema.tables WHERE table_schema = 'mart'")
+    )
+    existing_mart_tables = {r.table_name for r in existing_mart_tables_result.fetchall()}
+
     # 1. Raw tables
     raw_result = await db.execute(
         text(
@@ -87,15 +93,17 @@ async def get_lineage(
             # Step -> Mart (dest)
             if s.dest_table and s.dest_table.startswith("mart."):
                 dest_name = s.dest_table.split(".", 1)[1]
-                mart_node = f"mart_{dest_name}"
-                edges.append({"from": s_node_id, "to": mart_node, "label": "produces"})
+                # Skip if mart table doesn't actually exist
+                if dest_name in existing_mart_tables:
+                    mart_node = f"mart_{dest_name}"
+                    edges.append({"from": s_node_id, "to": mart_node, "label": "produces"})
 
             # Step chain
             if prev_step_id:
                 edges.append({"from": prev_step_id, "to": s_node_id, "label": "next"})
             prev_step_id = s_node_id
 
-    # 3. Mart tables from metadata
+    # 3. Mart tables from metadata (only if table actually exists in mart schema)
     mart_result = await db.execute(
         text(
             "SELECT m.*, p.name AS pipeline_name "
@@ -105,7 +113,12 @@ async def get_lineage(
         )
     )
     existing_mart_nodes = {n["id"] for n in nodes if n["type"] == "mart"}
+    
     for r in mart_result.fetchall():
+        # Skip if mart table doesn't actually exist in database
+        if r.table_name not in existing_mart_tables:
+            continue
+            
         node_id = f"mart_{r.table_name}"
         if node_id not in existing_mart_nodes:
             from app.services.mart_metadata import compute_freshness
@@ -151,6 +164,9 @@ async def get_lineage(
             mart_name = dep.mart_table_name
             if mart_name.startswith("mart."):
                 mart_name = mart_name.split(".", 1)[1]
+            # Skip if mart table doesn't actually exist
+            if mart_name not in existing_mart_tables:
+                continue
             mart_node = f"mart_{mart_name}"
             edges.append({"from": mart_node, "to": d_node_id, "label": "consumes"})
 
