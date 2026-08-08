@@ -1,4 +1,4 @@
-# ⚡ EduPulse Backend
+# ⚡ Datapulse Backend
 
 <div align="center">
 
@@ -18,7 +18,7 @@
 
 ## 📖 About The Project
 
-Backend FastAPI yang menyediakan seluruh logic untuk platform EduPulse — mulai dari pipeline ETL, data quality checks, BI dashboard embedding, AI-powered analytics, hingga user management dengan RBAC.
+Backend FastAPI yang menyediakan seluruh logic untuk platform Datapulse — mulai dari pipeline ETL, data quality checks, BI dashboard embedding, AI-powered analytics, hingga user management dengan RBAC.
 
 ### 🎯 Key Features
 
@@ -74,8 +74,8 @@ Backend FastAPI yang menyediakan seluruh logic untuk platform EduPulse — mulai
 
 1. **Clone the repository**
 ```bash
-git clone https://github.com/Bagus2510/edupulse.git
-cd edupulse/backend
+git clone https://github.com/Bagus2510/datapulse.git
+cd datapulse/backend
 ```
 
 2. **Create virtual environment**
@@ -100,7 +100,7 @@ DB_HOST=localhost
 DB_PORT=5432
 DB_USER=postgres
 DB_PASSWORD=your-password
-DB_NAME=edupulse
+DB_NAME=datapulse
 GEMINI_API_KEY=your-gemini-key
 SECRET_KEY=your-secret-key
 ```
@@ -341,7 +341,7 @@ async def delete_pipeline(current_user: AdminUserDep):
 
 ## 🙏 Acknowledgments
 
-- Built as part of EduPulse — Analytics Platform for Education
+- Built as part of Datapulse — Analytics Platform for Education
 - Powered by FastAPI, SQLAlchemy, and Google Gemini
 
 ---
