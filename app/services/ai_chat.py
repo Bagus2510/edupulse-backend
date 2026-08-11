@@ -13,57 +13,60 @@ from app.services.superset_data import get_dashboard_data
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_CHAT_SYSTEM_PROMPT = """You are a data analyst for an analytics platform.
+DEFAULT_CHAT_SYSTEM_PROMPT = """Anda adalah data analyst untuk platform analitik.
 
-STRICT RULES:
-- Analyze ONLY the real dashboard/chart data provided in the conversation.
-- Never invent numbers, trends, chart names, targets, or conclusions.
-- FORBIDDEN: generate code, SQL, images, scripts, or anything outside data analysis.
-- If asked for something outside data analysis, politely refuse and redirect to the dashboard data.
-- Language: {language}
+ATURAN KETAT:
+- Analisis HANYA data dashboard/chart yang tersedia di context.
+- Jangan mengarang angka, tren, nama chart, target, atau kesimpulan.
+- LARANGAN: generate kode, SQL, gambar, script, atau apapun di luar analisis data.
+- Jika ditanya di luar analisis data, tolak dengan sopan.
+- Bahasa: {language}
 
-RESPONSE MODE:
-1. FACTUAL MODE — Use this for a short question asking for a number, category, comparison,
-   or direct value. Answer in 1-3 concise sentences, then include the source chart when known:
+ATURAN KRITIS - NAMA CHART:
+- Anda WAJIB menggunakan NAMA CHART yang TEPAT dari context (contoh: "Tren Total Pengangguran").
+- DILARANG menggunakan ID chart atau nomor seperti "Chart 9", "Chart 10", "Chart 11", "Chart 12".
+- Nama chart ada di format: === Chart 'Nama Chart' (type: ...)
+- Gunakan nama exact tersebut saat merujuk temuan.
 
-**Jawaban:** [direct answer with the exact number]
-**Sumber data:** [chart name]
+MODE RESPONS:
+1. MODE FAKTUAL — Untuk pertanyaan singkat tentang angka, kategori, perbandingan, atau nilai langsung. Jawab dalam 1-3 kalimat singkat:
 
-2. ANALYSIS MODE — Use this when the user asks for analysis, summary, insight, pattern,
-   trend, recommendation, anomaly, or a complete overview. Use this structure:
+**Jawaban:** [jawaban langsung dengan angka pasti]
+**Sumber data:** [nama chart dari context]
+
+2. MODE ANALISIS — Untuk permintaan analisis, ringkasan, insight, pola, tren, rekomendasi, atau gambaran lengkap. Gunakan struktur ini:
 
 ## Ringkasan
-One short paragraph based on the actual data.
+Satu paragraf singkat berdasarkan data aktual.
 
 ## Temuan Utama
-- **[Chart name]:** Specific finding with numbers.
-- **[Chart name]:** Specific finding with numbers.
+- **[Nama Chart]:** Temuan spesifik dengan angka.
+- **[Nama Chart]:** Temuan spesifik dengan angka.
 
 ## Tren & Pola
-- Mention only patterns supported by the data.
-- If there is no time dimension or historical comparison, say that a trend cannot be concluded.
+- Sebutkan hanya pola yang didukung data.
+- Jika tidak ada dimensi waktu atau perbandingan historis, tulis tren tidak dapat disimpulkan.
 
 ## Rekomendasi
-- Recommendations must directly follow from the findings.
-- Do not recommend an action when the data is insufficient; state what data is needed instead.
+- Rekomendasi harus mengikuti temuan secara langsung.
+- Jika data tidak cukup, tulis data apa yang diperlukan.
 
 ## Potensi Masalah
-- Mention only anomalies, gaps, or risks supported by evidence.
-- If there is no sufficient evidence, write: "Tidak ditemukan potensi masalah signifikan berdasarkan data yang tersedia."
+- Sebutkan hanya anomali, celah, atau risiko yang didukung bukti.
+- Jika tidak ada bukti cukup, tulis: "Tidak ditemukan potensi masalah signifikan berdasarkan data yang tersedia."
 
 ## Kualitas Data
-- State relevant limitations: empty charts, missing fields, sample-only data,
-  lack of historical data, or lack of a comparison target.
+- Sebutkan keterbatasan: chart kosong, kolom hilang, data sampel, kurang data historis, atau kurang target perbandingan.
 
-IMPORTANT FORMATTING RULES:
-- Use Markdown headings only in ANALYSIS MODE.
-- Use bullet points for lists and bold labels before important values.
-- Always include exact numbers, percentages, counts, or averages when available.
-- Name the source chart for every important finding whenever known.
-- Keep answers concise and do not repeat the same finding in multiple sections.
-- Separate facts from interpretation. Do not present an assumption as a fact.
+ATURAN FORMATTING PENTING:
+- Gunakan heading Markdown hanya di MODE ANALISIS.
+- Gunakan bullet point untuk daftar dan bold label sebelum nilai penting.
+- Selalu sertakan angka pasti, persentase, jumlah, atau rata-rata jika tersedia.
+- Sebutkan nama chart sumber untuk setiap temuan penting.
+- Jawaban harus singkat dan jangan ulangi temuan yang sama di beberapa bagian.
+- Pisahkan fakta dari interpretasi. Jangan presentasikan asumsi sebagai fakta.
 
-Chart data context will be provided at the start of the conversation. Base every answer on REAL data, not assumptions."""
+Context data chart akan diberikan di awal percakapan. Setiap jawaban harus berdasarkan data NYATA, bukan asumsi."""
 
 MAX_HISTORY_MESSAGES = 20
 
@@ -242,26 +245,26 @@ def _get_llm() -> ChatGoogleGenerativeAI:
         model=settings.GEMINI_MODEL,
         google_api_key=settings.GEMINI_API_KEY,
         temperature=0.3,
-        max_output_tokens=4096,
+        max_output_tokens=8192,
     )
 
 
 def _format_chart_data(charts: list[dict]) -> str:
-    """Format chart data for context."""
+    """Format chart data for context. Use EXACT chart names, never chart IDs."""
     parts = []
-    for chart in charts:
+    for i, chart in enumerate(charts, 1):
         name = chart.get("name", "Unknown")
         viz = chart.get("viz_type", "unknown")
         data = chart.get("data")
 
         if not data:
-            parts.append(f"Chart: {name} (type: {viz}) — no data available")
+            parts.append(f"=== Chart '{name}' (type: {viz}) — no data available ===")
             continue
 
         rows_count = len(data)
         sample = data[:10]
 
-        parts.append(f"Chart: {name} (type: {viz}, {rows_count} rows)")
+        parts.append(f"=== Chart '{name}' (type: {viz}, {rows_count} rows) ===")
         parts.append(f"Data sample: {json.dumps(sample, default=str, ensure_ascii=False)}")
 
         if data and isinstance(data[0], dict):
@@ -273,6 +276,20 @@ def _format_chart_data(charts: list[dict]) -> str:
                     parts.append(f"  {col}: avg={avg:.2f}, min={min(numeric)}, max={max(numeric)}")
 
     return "\n".join(parts)
+
+
+def _post_process_response(response: str, charts: list[dict]) -> str:
+    """Replace 'Chart X' with actual chart names in the response."""
+    import re
+    result = response
+    for chart in charts:
+        chart_id = chart.get("id")
+        chart_name = chart.get("name", "")
+        if chart_id and chart_name:
+            # Replace "Chart 9", "Chart 10", etc. with actual name
+            pattern = rf'\bChart\s+{chart_id}\b'
+            result = re.sub(pattern, chart_name, result)
+    return result
 
 
 async def get_chat_evidence(dashboard_uuid: str) -> dict:
@@ -325,17 +342,16 @@ async def _get_chart_context(dashboard_uuid: str) -> str:
         logger.warning("_get_chart_context called with empty dashboard_uuid")
         return "(Tidak ada UUID dashboard yang diberikan)"
 
-    if dashboard_uuid in _chart_cache:
-        charts = _chart_cache[dashboard_uuid]
-        logger.info("Using cached chart data for %s (%d charts)", dashboard_uuid, len(charts))
-    else:
-        try:
-            charts = await get_dashboard_data(dashboard_uuid)
-            _chart_cache[dashboard_uuid] = charts
-            logger.info("Fetched chart data for %s: %d charts", dashboard_uuid, len(charts))
-        except Exception as e:
-            logger.warning("Failed to fetch chart data for %s: %s", dashboard_uuid, e)
-            return "(Gagal mengambil data chart dari Superset)"
+    # Always fetch fresh data (no cache) to ensure chart names are current
+    try:
+        charts = await get_dashboard_data(dashboard_uuid)
+        logger.info("Fetched chart data for %s: %d charts", dashboard_uuid, len(charts))
+        # Log chart names for debugging
+        for c in charts:
+            logger.info("  Chart name: '%s', viz_type: '%s'", c.get("name"), c.get("viz_type"))
+    except Exception as e:
+        logger.warning("Failed to fetch chart data for %s: %s", dashboard_uuid, e)
+        return "(Gagal mengambil data chart dari Superset)"
 
     result = _format_chart_data(charts)
     if not result:
@@ -351,8 +367,11 @@ def _build_prompt_context(
     return (
         f"Dashboard: {dashboard_title}\n"
         f"UUID: {dashboard_uuid}\n\n"
-        f"Chart data:\n{chart_context}\n\n"
-        f"Sekarang analisis data di atas. User akan bertanya tentang data ini."
+        f"=== CHART DATA (use EXACT chart names below, NEVER use Chart IDs like Chart 9, Chart 10) ===\n"
+        f"{chart_context}\n"
+        f"=== END CHART DATA ===\n\n"
+        f"Sekarang analisis data di atas. User akan bertanya tentang data ini.\n"
+        f"IMPORTANT: When referencing charts, ALWAYS use the EXACT chart name (e.g., 'Tren Total Pengangguran'), NOT the chart number (e.g., 'Chart 9')."
     )
 
 
@@ -383,6 +402,9 @@ async def chat(
 
     chart_context = await _get_chart_context(dashboard_uuid)
 
+    # Get chart data for post-processing
+    charts = await get_dashboard_data(dashboard_uuid) if dashboard_uuid else []
+
     prompt = ChatPromptTemplate.from_messages([
         ("system", system_prompt),
         MessagesPlaceholder(variable_name="chat_history"),
@@ -403,10 +425,13 @@ async def chat(
         "input": message,
     })
 
-    history.add_ai_message(response.content)
-    await _save_message(session_id, "assistant", response.content, evidence=evidence)
+    # Post-process to replace Chart X with actual chart names
+    final_response = _post_process_response(response.content, charts)
 
-    return response.content
+    history.add_ai_message(final_response)
+    await _save_message(session_id, "assistant", final_response, evidence=evidence)
+
+    return final_response
 
 
 async def chat_stream(
@@ -425,6 +450,9 @@ async def chat_stream(
     system_prompt = _get_system_prompt()
 
     chart_context = await _get_chart_context(dashboard_uuid)
+
+    # Get chart data for post-processing
+    charts = await get_dashboard_data(dashboard_uuid) if dashboard_uuid else []
 
     prompt = ChatPromptTemplate.from_messages([
         ("system", system_prompt),
@@ -456,6 +484,12 @@ async def chat_stream(
         error_msg = "Terjadi kesalahan saat memproses response. Silakan coba lagi."
         full_response = error_msg
         yield error_msg
+
+    # Post-process to replace Chart X with actual chart names
+    final_response = _post_process_response(full_response, charts)
+
+    history.add_ai_message(final_response)
+    await _save_message(session_id, "assistant", final_response, evidence=evidence)
 
     history.add_ai_message(full_response)
     await _save_message(session_id, "assistant", full_response, evidence=evidence)
