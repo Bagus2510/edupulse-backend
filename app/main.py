@@ -11,8 +11,8 @@ from app.routers import superset, airflow, ai, settings as settings_router, dash
 from app.services.data_quality import backfill_asset_metadata
 
 app = FastAPI(
-    title="EduPulse Backend",
-    description="Backend API for EduPulse Analytics Platform",
+    title="Datapulse Backend",
+    description="Backend API for Datapulse Analytics Platform",
     version="1.0.0",
 )
 
