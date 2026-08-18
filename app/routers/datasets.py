@@ -10,6 +10,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
+from app.core.pg_pool import get_app_pool
 from app.core.security import AdminUserDep, EditorUserDep, get_current_user
 from app.models.schemas import TableInfo
 from app.services.data_quality import inspect_asset_quality, run_quality_checks, sync_asset_metadata
@@ -238,17 +239,23 @@ async def upload_dataset(
     try:
         await db.execute(text(f'DROP TABLE IF EXISTS "raw"."{table_name}"'))
 
-        cols_def = ", ".join(f'"{col}" {dtype}' for col, dtype in zip(df.columns, [_map_dtype(t) for t in df.dtypes]))
+        columns = list(df.columns)
+        cols_def = ", ".join(f'"{col}" {dtype}' for col, dtype in zip(columns, [_map_dtype(t) for t in df.dtypes]))
         await db.execute(text(f'CREATE TABLE "raw"."{table_name}" ({cols_def})'))
-
-        for _, row in df.iterrows():
-            placeholders = ", ".join([f":{c}" for c in df.columns])
-            await db.execute(
-                text(f'INSERT INTO "raw"."{table_name}" VALUES ({placeholders})'),
-                {c: (None if pd.isna(v) else (v.item() if hasattr(v, "item") else v)) for c, v in zip(df.columns, row)},
-            )
-
         await db.commit()
+
+        records = [
+            tuple(None if pd.isna(value) else (value.item() if hasattr(value, "item") else value) for value in row)
+            for row in df.itertuples(index=False, name=None)
+        ]
+        pool = await get_app_pool()
+        async with pool.acquire() as conn:
+            await conn.copy_records_to_table(
+                table_name,
+                schema_name="raw",
+                columns=columns,
+                records=records,
+            )
         asset_id = await sync_asset_metadata(
             db,
             schema_name="raw",
@@ -262,7 +269,12 @@ async def upload_dataset(
     except Exception as e:
         logger.error("Failed to insert data: %s", e)
         await db.rollback()
-        raise HTTPException(status_code=500, detail=f"Gagal menyimpan data: {e}")
+        try:
+            await db.execute(text(f'DROP TABLE IF EXISTS "raw"."{table_name}"'))
+            await db.commit()
+        except Exception:
+            await db.rollback()
+        raise HTTPException(status_code=500, detail="Gagal menyimpan data upload")
 
     return {
         "message": f"Berhasil upload {len(df)} baris ke raw.{table_name}",

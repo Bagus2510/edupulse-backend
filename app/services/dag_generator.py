@@ -65,6 +65,9 @@ def _build_step_function(
                 f'    ti.xcom_push(key="duration_ms", value=_elapsed)\n'
             )
         else:
+            replace_dest = ""
+            if dest_table and query.strip().upper().startswith("CREATE TABLE"):
+                replace_dest = f'    cursor.execute("DROP TABLE IF EXISTS {dest_table}")\n'
             body = (
                 f"def {func_name}(ti):\n"
                 f"    import time\n"
@@ -73,6 +76,7 @@ def _build_step_function(
                 f'    hook = PostgresHook(postgres_conn_id="edupulse")\n'
                 f"    conn = hook.get_conn()\n"
                 f"    cursor = conn.cursor()\n"
+                f"{replace_dest}"
                 f"    cursor.execute({safe_query})\n"
                 f"    rowcount = cursor.rowcount\n"
                 f"    conn.commit()\n"
@@ -205,7 +209,7 @@ def generate_dag_content(dag_id: str, pipeline_name: str, steps: list[dict], sch
         f"            except Exception:\n"
         f"                pass\n"
         f"        cursor.execute(\n"
-        f"            \"UPDATE app.pipeline_runs SET rows_read = %s, rows_written = %s, duration_ms = %s, quality_status = 'passed' WHERE dag_id = %s AND status = 'running' ORDER BY id DESC LIMIT 1\",\n"
+        f'            "UPDATE app.pipeline_runs SET rows_read = %s, rows_written = %s, duration_ms = %s, quality_status = \'passed\' WHERE id = (SELECT id FROM app.pipeline_runs WHERE dag_id = %s AND status = \'running\' ORDER BY id DESC LIMIT 1)",\n'
         f"            (total_rows_read, total_rows_written, total_duration_ms, dag_id)\n"
         f"        )\n"
         f"        conn.commit()\n"
@@ -230,7 +234,7 @@ def generate_dag_content(dag_id: str, pipeline_name: str, steps: list[dict], sch
         f"        tb = traceback.format_exception(type(context.get('exception', Exception())), context.get('exception', Exception()), context.get('exception', None).__traceback__ if hasattr(context.get('exception', Exception()), '__traceback__') else None)\n"
         f"        full_error = error_msg + '\\n' + ''.join(tb) if tb else error_msg\n"
         f"        cursor.execute(\n"
-        f"            \"UPDATE app.pipeline_runs SET status = 'failed', error_message = %s WHERE dag_id = %s AND status = 'running' ORDER BY id DESC LIMIT 1\",\n"
+        f'            "UPDATE app.pipeline_runs SET status = \'failed\', error_message = %s WHERE id = (SELECT id FROM app.pipeline_runs WHERE dag_id = %s AND status = \'running\' ORDER BY id DESC LIMIT 1)",\n'
         f"            (full_error[:2000], dag_id)\n"
         f"        )\n"
         f"        conn.commit()\n"

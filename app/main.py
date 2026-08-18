@@ -6,6 +6,7 @@ from sqlalchemy import text
 
 from app.core.config import settings
 from app.core.database import check_db_connection, async_session
+from app.core.pg_pool import close_pools
 from app.core.rate_limit import limiter
 from app.routers import superset, airflow, ai, settings as settings_router, dashboards, activity, pipeline, auth, pipelines, home, datasets, lineage, domains, metadata, admin_users, quality_rules
 from app.services.data_quality import backfill_asset_metadata
@@ -199,6 +200,11 @@ async def ensure_schemas():
         await session.execute(text("ALTER TABLE app.chat_messages ADD COLUMN IF NOT EXISTS evidence JSONB DEFAULT NULL"))
         await session.commit()
         await backfill_asset_metadata(session)
+
+
+@app.on_event("shutdown")
+async def shutdown_resources():
+    await close_pools()
 
 
 @app.get("/api/health")

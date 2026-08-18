@@ -1,31 +1,18 @@
 import json
 import logging
+import re
 
-import asyncpg
-
-from app.core.config import settings
+from app.core.pg_pool import get_app_pool, get_superset_pool
 
 logger = logging.getLogger(__name__)
 
 
 async def _get_superset_pool():
-    return await asyncpg.create_pool(
-        host=settings.SUPERSET_DB_HOST,
-        port=settings.SUPERSET_DB_PORT,
-        user=settings.SUPERSET_DB_USER,
-        password=settings.SUPERSET_DB_PASSWORD,
-        database=settings.SUPERSET_DB_NAME,
-    )
+    return await get_superset_pool()
 
 
 async def _get_edupulse_pool():
-    return await asyncpg.create_pool(
-        host=settings.DB_HOST,
-        port=settings.DB_PORT,
-        user=settings.DB_USER,
-        password=settings.DB_PASSWORD,
-        database=settings.DB_NAME,
-    )
+    return await get_app_pool()
 
 
 async def get_dashboard_charts(dashboard_uuid: str) -> list[dict]:
@@ -119,11 +106,9 @@ async def get_dashboard_charts(dashboard_uuid: str) -> list[dict]:
     except Exception as e:
         logger.error("Error fetching charts for dashboard %s: %s", dashboard_uuid, e)
         return []
-    finally:
-        await pool.close()
 
 
-async def get_chart_data(chart_id: int, table_name: str = None, schema: str = None) -> dict:
+async def get_chart_data(chart_id: int, table_name: str | None = None, schema: str | None = None) -> dict:
     """Fetch chart data by querying edupulse DB directly."""
     chart_name = f"Chart {chart_id}"
 
@@ -155,10 +140,15 @@ async def get_chart_data(chart_id: int, table_name: str = None, schema: str = No
                         except (json.JSONDecodeError, TypeError):
                             pass
         finally:
-            await spool.close()
+            pass
 
     if not table_name:
         logger.warning("No table_name for chart %d (%s)", chart_id, chart_name)
+        return {"id": chart_id, "name": chart_name, "viz_type": "unknown", "data": None}
+
+    # Identifiers cannot use bind parameters; validate metadata-derived names first.
+    if not schema or not re.fullmatch(r"[A-Za-z0-9_]+", schema) or not re.fullmatch(r"[A-Za-z0-9_]+", table_name):
+        logger.warning("Rejected unsafe chart identifier: %s.%s", schema, table_name)
         return {"id": chart_id, "name": chart_name, "viz_type": "unknown", "data": None}
 
     # Query edupulse DB directly
@@ -186,8 +176,6 @@ async def get_chart_data(chart_id: int, table_name: str = None, schema: str = No
     except Exception as e:
         logger.error("Failed to query %s.%s for chart %d: %s", schema, table_name, chart_id, e)
         return {"id": chart_id, "name": chart_name, "viz_type": "unknown", "data": None}
-    finally:
-        await epool.close()
 
 
 async def get_dashboard_data(dashboard_uuid: str) -> list[dict]:
@@ -195,6 +183,10 @@ async def get_dashboard_data(dashboard_uuid: str) -> list[dict]:
     charts = await get_dashboard_charts(dashboard_uuid)
     results = []
     for chart in charts:
-        data = await get_chart_data(chart["id"], chart.get("table_name"), chart.get("schema"))
+        data = await get_chart_data(
+            chart["id"],
+            chart.get("table_name") or None,
+            chart.get("schema") or None,
+        )
         results.append(data)
     return results

@@ -1,14 +1,14 @@
 import json
 import logging
+import time
 from typing import AsyncGenerator
 
-import asyncpg
 from langchain_core.chat_history import InMemoryChatMessageHistory
-from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 from app.core.config import settings
+from app.core.pg_pool import get_app_pool
 from app.services.superset_data import get_dashboard_data
 
 logger = logging.getLogger(__name__)
@@ -70,17 +70,16 @@ Context data chart akan diberikan di awal percakapan. Setiap jawaban harus berda
 
 MAX_HISTORY_MESSAGES = 20
 
-_chart_cache: dict[str, list[dict]] = {}
+class SessionAccessError(PermissionError):
+    """Raised when caller does not own requested chat session."""
+
+
+_chart_cache: dict[str, tuple[float, list[dict]]] = {}
+_CACHE_TTL_SECONDS = 30
 
 
 async def _get_db():
-    return await asyncpg.create_pool(
-        host=settings.DB_HOST,
-        port=settings.DB_PORT,
-        user=settings.DB_USER,
-        password=settings.DB_PASSWORD,
-        database=settings.DB_NAME,
-    )
+    return await get_app_pool()
 
 
 async def ensure_session(
@@ -93,11 +92,13 @@ async def ensure_session(
     pool = await _get_db()
     try:
         async with pool.acquire() as conn:
-            exists = await conn.fetchval(
-                "SELECT 1 FROM app.chat_sessions WHERE session_id = $1",
+            owner_id = await conn.fetchval(
+                "SELECT user_id FROM app.chat_sessions WHERE session_id = $1",
                 session_id,
             )
-            if not exists:
+            if owner_id is not None and owner_id != user_id:
+                raise SessionAccessError("Chat session bukan milik user ini")
+            if owner_id is None:
                 title = dashboard_title or "New Chat"
                 await conn.execute(
                     """INSERT INTO app.chat_sessions (session_id, user_id, dashboard_uuid, dashboard_title, title)
@@ -105,7 +106,7 @@ async def ensure_session(
                     session_id, user_id, dashboard_uuid, dashboard_title, title,
                 )
     finally:
-        await pool.close()
+        pass
 
 
 async def _save_message(session_id: str, role: str, content: str, evidence: dict | None = None) -> None:
@@ -129,7 +130,7 @@ async def _save_message(session_id: str, role: str, content: str, evidence: dict
                 session_id,
             )
     finally:
-        await pool.close()
+        pass
 
 
 async def _load_history(session_id: str) -> InMemoryChatMessageHistory:
@@ -149,7 +150,7 @@ async def _load_history(session_id: str) -> InMemoryChatMessageHistory:
                 elif row["role"] == "assistant":
                     history.add_ai_message(row["content"])
     finally:
-        await pool.close()
+        pass
 
     # Trim if too long
     if len(history.messages) > MAX_HISTORY_MESSAGES:
@@ -164,7 +165,7 @@ async def _load_history(session_id: str) -> InMemoryChatMessageHistory:
     return history
 
 
-async def list_sessions(dashboard_uuid: str | None = None) -> list[dict]:
+async def list_sessions(user_id: int, dashboard_uuid: str | None = None) -> list[dict]:
     """List all chat sessions, optionally filtered by dashboard."""
     pool = await _get_db()
     try:
@@ -174,31 +175,36 @@ async def list_sessions(dashboard_uuid: str | None = None) -> list[dict]:
                     """SELECT session_id, title, dashboard_title, dashboard_uuid,
                               created_at, updated_at
                        FROM app.chat_sessions
-                       WHERE dashboard_uuid = $1
+                       WHERE user_id = $1 AND dashboard_uuid = $2
                        ORDER BY updated_at DESC""",
-                    dashboard_uuid,
+                    user_id, dashboard_uuid,
                 )
             else:
                 rows = await conn.fetch(
                     """SELECT session_id, title, dashboard_title, dashboard_uuid,
                               created_at, updated_at
                        FROM app.chat_sessions
-                       ORDER BY updated_at DESC"""
+                       WHERE user_id = $1
+                       ORDER BY updated_at DESC""",
+                    user_id,
                 )
             return [dict(r) for r in rows]
     finally:
-        await pool.close()
+        pass
 
 
-async def get_session_history(session_id: str) -> list[dict]:
-    """Get messages for a session, including persisted evidence."""
+async def get_session_history(session_id: str, user_id: int) -> list[dict]:
+    """Get messages for an owned session, including persisted evidence."""
     pool = await _get_db()
     try:
         async with pool.acquire() as conn:
             rows = await conn.fetch(
-                """SELECT role, content, evidence, created_at FROM app.chat_messages
-                   WHERE session_id = $1 ORDER BY created_at ASC""",
-                session_id,
+                """SELECT m.role, m.content, m.evidence, m.created_at
+                   FROM app.chat_messages m
+                   JOIN app.chat_sessions s ON s.session_id = m.session_id
+                   WHERE m.session_id = $1 AND s.user_id = $2
+                   ORDER BY m.created_at ASC""",
+                session_id, user_id,
             )
             result = []
             for r in rows:
@@ -210,33 +216,32 @@ async def get_session_history(session_id: str) -> list[dict]:
                 result.append(item)
             return result
     finally:
-        await pool.close()
+        pass
 
 
-async def delete_session(session_id: str) -> None:
-    """Delete a chat session and its messages."""
+async def delete_session(session_id: str, user_id: int) -> None:
+    """Delete an owned chat session and its messages."""
     pool = await _get_db()
-    try:
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "DELETE FROM app.chat_sessions WHERE session_id = $1",
-                session_id,
-            )
-    finally:
-        await pool.close()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM app.chat_sessions WHERE session_id = $1 AND user_id = $2",
+            session_id, user_id,
+        )
 
 
-async def clear_chat_history(session_id: str) -> None:
-    """Clear chat history for a session."""
+async def clear_chat_history(session_id: str, user_id: int) -> None:
+    """Clear messages only for an owned chat session."""
     pool = await _get_db()
-    try:
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "DELETE FROM app.chat_messages WHERE session_id = $1",
-                session_id,
-            )
-    finally:
-        await pool.close()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """DELETE FROM app.chat_messages
+               WHERE session_id = $1
+                 AND EXISTS (
+                     SELECT 1 FROM app.chat_sessions
+                     WHERE session_id = $1 AND user_id = $2
+                 )""",
+            session_id, user_id,
+        )
     logger.info("Cleared chat history for session %s", session_id)
 
 
@@ -292,10 +297,21 @@ def _post_process_response(response: str, charts: list[dict]) -> str:
     return result
 
 
+async def _get_cached_dashboard_data(dashboard_uuid: str) -> list[dict]:
+    if not dashboard_uuid:
+        return []
+    cached = _chart_cache.get(dashboard_uuid)
+    if cached and time.monotonic() - cached[0] < _CACHE_TTL_SECONDS:
+        return cached[1]
+    charts = await get_dashboard_data(dashboard_uuid)
+    _chart_cache[dashboard_uuid] = (time.monotonic(), charts)
+    return charts
+
+
 async def get_chat_evidence(dashboard_uuid: str) -> dict:
-    """Build explainability metadata from the same chart context used by chat."""
-    chart_context = await _get_chart_context(dashboard_uuid)
-    charts = _chart_cache.get(dashboard_uuid, []) if dashboard_uuid else []
+    """Build explainability metadata from same cached chart data used by chat."""
+    charts = await _get_cached_dashboard_data(dashboard_uuid) if dashboard_uuid else []
+    chart_context = _format_chart_data(charts)
     source_charts = []
     total_rows = 0
     charts_with_data = 0
@@ -342,10 +358,9 @@ async def _get_chart_context(dashboard_uuid: str) -> str:
         logger.warning("_get_chart_context called with empty dashboard_uuid")
         return "(Tidak ada UUID dashboard yang diberikan)"
 
-    # Always fetch fresh data (no cache) to ensure chart names are current
     try:
-        charts = await get_dashboard_data(dashboard_uuid)
-        logger.info("Fetched chart data for %s: %d charts", dashboard_uuid, len(charts))
+        charts = await _get_cached_dashboard_data(dashboard_uuid)
+        logger.info("Loaded chart data for %s: %d charts", dashboard_uuid, len(charts))
         # Log chart names for debugging
         for c in charts:
             logger.info("  Chart name: '%s', viz_type: '%s'", c.get("name"), c.get("viz_type"))
@@ -402,8 +417,8 @@ async def chat(
 
     chart_context = await _get_chart_context(dashboard_uuid)
 
-    # Get chart data for post-processing
-    charts = await get_dashboard_data(dashboard_uuid) if dashboard_uuid else []
+    # Reuse cached chart data for post-processing
+    charts = await _get_cached_dashboard_data(dashboard_uuid) if dashboard_uuid else []
 
     prompt = ChatPromptTemplate.from_messages([
         ("system", system_prompt),
@@ -451,8 +466,8 @@ async def chat_stream(
 
     chart_context = await _get_chart_context(dashboard_uuid)
 
-    # Get chart data for post-processing
-    charts = await get_dashboard_data(dashboard_uuid) if dashboard_uuid else []
+    # Reuse cached chart data for post-processing
+    charts = await _get_cached_dashboard_data(dashboard_uuid) if dashboard_uuid else []
 
     prompt = ChatPromptTemplate.from_messages([
         ("system", system_prompt),
@@ -490,6 +505,3 @@ async def chat_stream(
 
     history.add_ai_message(final_response)
     await _save_message(session_id, "assistant", final_response, evidence=evidence)
-
-    history.add_ai_message(full_response)
-    await _save_message(session_id, "assistant", full_response, evidence=evidence)

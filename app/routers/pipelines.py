@@ -7,7 +7,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.core.security import AdminUserDep, EditorUserDep, get_current_user
+from app.core.security import AdminUserDep, EditorUserDep, ViewerUserDep, get_current_user
 from app.models.schemas import (
     PipelineCreate,
     PipelineListResponse,
@@ -29,6 +29,7 @@ router = APIRouter(prefix="/api/pipelines", tags=["pipelines"])
 
 @router.get("", response_model=list[PipelineListResponse])
 async def list_pipelines(
+    current_user: ViewerUserDep,
     domain_id: int | None = None,
     db: AsyncSession = Depends(get_db),
 ):
@@ -188,7 +189,11 @@ async def list_columns(
 
 
 @router.get("/{pipeline_id}", response_model=PipelineResponse)
-async def get_pipeline(pipeline_id: int, db: AsyncSession = Depends(get_db)):
+async def get_pipeline(
+    pipeline_id: int,
+    current_user: ViewerUserDep,
+    db: AsyncSession = Depends(get_db),
+):
     return await _get_pipeline(pipeline_id, db)
 
 
@@ -283,9 +288,15 @@ async def run_pipeline(
     current_user: EditorUserDep,
     db: AsyncSession = Depends(get_db),
 ):
-    pipeline = await _get_pipeline_raw(pipeline_id, db)
-    if not pipeline:
+    # Lock row while claiming run. Prevents two concurrent trigger requests.
+    locked = await db.execute(
+        text("SELECT id, status FROM app.pipelines WHERE id = :id FOR UPDATE"),
+        {"id": pipeline_id},
+    )
+    locked_pipeline = locked.fetchone()
+    if not locked_pipeline:
         raise HTTPException(status_code=404, detail="Pipeline tidak ditemukan")
+    pipeline = await _get_pipeline_raw(pipeline_id, db)
 
     if pipeline.get("status") == "running":
         raise HTTPException(status_code=409, detail="Pipeline sedang berjalan. Tunggu hingga selesai.")
@@ -410,7 +421,11 @@ async def cancel_pipeline(
 
 
 @router.get("/{pipeline_id}/status")
-async def pipeline_status(pipeline_id: int, db: AsyncSession = Depends(get_db)):
+async def pipeline_status(
+    pipeline_id: int,
+    current_user: ViewerUserDep,
+    db: AsyncSession = Depends(get_db),
+):
     pipeline = await _get_pipeline_raw(pipeline_id, db)
     if not pipeline:
         raise HTTPException(status_code=404, detail="Pipeline tidak ditemukan")
@@ -469,6 +484,7 @@ async def pipeline_status(pipeline_id: int, db: AsyncSession = Depends(get_db)):
 @router.get("/{pipeline_id}/runs")
 async def list_pipeline_runs(
     pipeline_id: int,
+    current_user: ViewerUserDep,
     limit: int = 20,
     db: AsyncSession = Depends(get_db),
 ):
@@ -523,7 +539,11 @@ async def toggle_pipeline_active(
 
 
 @router.get("/{pipeline_id}/consumers")
-async def pipeline_consumers(pipeline_id: int, db: AsyncSession = Depends(get_db)):
+async def pipeline_consumers(
+    pipeline_id: int,
+    current_user: ViewerUserDep,
+    db: AsyncSession = Depends(get_db),
+):
     """Which dashboards consume this pipeline's mart tables."""
     result = await db.execute(
         text("""

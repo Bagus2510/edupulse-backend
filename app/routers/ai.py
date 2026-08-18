@@ -17,7 +17,7 @@ from app.models.schemas import (
 from app.services.gemini_client import analyze_dashboard
 from app.services.ai_chat import (
     chat, chat_stream, get_chat_evidence, clear_chat_history,
-    list_sessions, get_session_history, delete_session,
+    list_sessions, get_session_history, delete_session, SessionAccessError,
 )
 from app.services.superset_data import get_dashboard_data
 
@@ -71,6 +71,8 @@ async def chat_endpoint(request: Request, req: ChatRequest, user: CurrentUserDep
             evidence=evidence,
         )
         return ChatResponse(response=response, session_id=req.session_id)
+    except SessionAccessError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except HTTPException:
         raise
     except Exception as e:
@@ -96,9 +98,12 @@ async def chat_stream_endpoint(request: Request, req: ChatRequest, user: Current
             ):
                 # JSON menjaga spasi awal token dan newline tetap utuh saat melewati SSE.
                 yield f"data: {json.dumps(str(chunk), ensure_ascii=False)}\n\n"
+        except SessionAccessError as e:
+            logger.warning("Chat session access denied: %s", e)
+            yield f"event: error\ndata: {json.dumps(str(e), ensure_ascii=False)}\n\n"
         except Exception as e:
             logger.error("Stream error: %s", e)
-            yield f"data: {json.dumps('Error: Gagal memproses response', ensure_ascii=False)}\n\n"
+            yield f"event: error\ndata: {json.dumps('Error: Gagal memproses response', ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(
@@ -114,24 +119,27 @@ async def chat_stream_endpoint(request: Request, req: ChatRequest, user: Current
 
 @router.post("/chat/clear")
 async def clear_chat(req: ChatClearRequest, user: CurrentUserDep):
-    await clear_chat_history(req.session_id)
+    try:
+        await clear_chat_history(req.session_id, user["id"])
+    except SessionAccessError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     return {"status": "ok", "session_id": req.session_id}
 
 
 @router.get("/chat/sessions")
 async def get_chat_sessions(request: Request, user: CurrentUserDep):
     dashboard_uuid = request.query_params.get("dashboard_uuid")
-    sessions = await list_sessions(dashboard_uuid=dashboard_uuid)
+    sessions = await list_sessions(user_id=user["id"], dashboard_uuid=dashboard_uuid)
     return sessions
 
 
 @router.get("/chat/history/{session_id}")
 async def get_chat_history_endpoint(session_id: str, user: CurrentUserDep):
-    messages = await get_session_history(session_id)
+    messages = await get_session_history(session_id, user["id"])
     return messages
 
 
 @router.delete("/chat/sessions/{session_id}")
 async def delete_chat_session(session_id: str, user: CurrentUserDep):
-    await delete_session(session_id)
+    await delete_session(session_id, user["id"])
     return {"status": "ok"}
