@@ -86,7 +86,7 @@ async def chat_stream_endpoint(request: Request, req: ChatRequest, user: Current
     async def event_generator():
         try:
             evidence = await get_chat_evidence(req.dashboard_uuid)
-            yield f"event: evidence\ndata: {json.dumps(evidence, ensure_ascii=False)}\n\n"
+            yield f"event: evidence\ndata: {json.dumps(evidence, ensure_ascii=False, default=str)}\n\n"
 
             async for chunk in chat_stream(
                 message=req.message,

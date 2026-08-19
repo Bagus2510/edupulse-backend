@@ -108,9 +108,16 @@ async def get_dashboard_charts(dashboard_uuid: str) -> list[dict]:
         return []
 
 
-async def get_chart_data(chart_id: int, table_name: str | None = None, schema: str | None = None) -> dict:
-    """Fetch chart data by querying edupulse DB directly."""
-    chart_name = f"Chart {chart_id}"
+async def get_chart_data(
+    chart_id: int,
+    table_name: str | None = None,
+    schema: str | None = None,
+    chart_name: str | None = None,
+    viz_type: str | None = None,
+) -> dict:
+    """Fetch chart data while preserving Superset chart metadata."""
+    resolved_chart_name = chart_name or f"Chart {chart_id}"
+    resolved_viz_type = viz_type or "unknown"
 
     # Get chart name from Superset DB if not provided
     if not table_name:
@@ -128,9 +135,9 @@ async def get_chart_data(chart_id: int, table_name: str | None = None, schema: s
                     chart_id,
                 )
                 if row:
-                    chart_name = row["slice_name"] or chart_name
-                    table_name = row["table_name"]
-                    schema = row["schema"]
+                    resolved_chart_name = row["slice_name"] or resolved_chart_name
+                    table_name = table_name or row["table_name"]
+                    schema = schema or row["schema"]
                     # Fallback: try params JSON
                     if not table_name and row["params"]:
                         try:
@@ -143,13 +150,13 @@ async def get_chart_data(chart_id: int, table_name: str | None = None, schema: s
             pass
 
     if not table_name:
-        logger.warning("No table_name for chart %d (%s)", chart_id, chart_name)
-        return {"id": chart_id, "name": chart_name, "viz_type": "unknown", "data": None}
+        logger.warning("No table_name for chart %d (%s)", chart_id, resolved_chart_name)
+        return {"id": chart_id, "name": resolved_chart_name, "viz_type": resolved_viz_type, "data": None}
 
     # Identifiers cannot use bind parameters; validate metadata-derived names first.
     if not schema or not re.fullmatch(r"[A-Za-z0-9_]+", schema) or not re.fullmatch(r"[A-Za-z0-9_]+", table_name):
         logger.warning("Rejected unsafe chart identifier: %s.%s", schema, table_name)
-        return {"id": chart_id, "name": chart_name, "viz_type": "unknown", "data": None}
+        return {"id": chart_id, "name": resolved_chart_name, "viz_type": resolved_viz_type, "data": None}
 
     # Query edupulse DB directly
     epool = await _get_edupulse_pool()
@@ -166,16 +173,18 @@ async def get_chart_data(chart_id: int, table_name: str | None = None, schema: s
                     if hasattr(v, 'isoformat'):
                         row[k] = str(v)
 
-            logger.info("Got %d rows for chart %d (%s)", len(data), chart_id, chart_name)
+            logger.info("Got %d rows for chart %d (%s)", len(data), chart_id, resolved_chart_name)
             return {
                 "id": chart_id,
-                "name": chart_name,
-                "viz_type": "unknown",
+                "name": resolved_chart_name,
+                "viz_type": resolved_viz_type,
+                "schema": schema,
+                "table_name": table_name,
                 "data": data,
             }
     except Exception as e:
         logger.error("Failed to query %s.%s for chart %d: %s", schema, table_name, chart_id, e)
-        return {"id": chart_id, "name": chart_name, "viz_type": "unknown", "data": None}
+        return {"id": chart_id, "name": resolved_chart_name, "viz_type": resolved_viz_type, "schema": schema, "table_name": table_name, "data": None}
 
 
 async def get_dashboard_data(dashboard_uuid: str) -> list[dict]:
@@ -187,6 +196,8 @@ async def get_dashboard_data(dashboard_uuid: str) -> list[dict]:
             chart["id"],
             chart.get("table_name") or None,
             chart.get("schema") or None,
+            chart.get("name") or None,
+            chart.get("viz_type") or None,
         )
         results.append(data)
     return results

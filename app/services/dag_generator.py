@@ -1,5 +1,6 @@
 import json
 import random
+import re
 import string
 from pathlib import Path
 
@@ -38,6 +39,15 @@ def _build_step_function(
     """Build a single step function with instrumentation (timing + rowcount + XCom push)."""
     source_comment = f"    # Source: {source_table}\n" if source_table else ""
     dest_comment = f"    # Dest: {dest_table}\n" if dest_table else ""
+    source_check = ""
+    if source_table:
+        if not re.fullmatch(r"(?:raw|mart)\.[A-Za-z0-9_]+", source_table):
+            raise ValueError(f"Unsafe source table: {source_table}")
+        source_check = (
+            f'    cursor.execute("SELECT COUNT(*) FROM {source_table}")\n'
+            f'    source_rows = cursor.fetchone()[0]\n'
+            f'    if source_rows == 0: raise ValueError("Source table {source_table} is empty")\n'
+        )
 
     if query_type == "sql":
         safe_query = json.dumps(query)
@@ -51,6 +61,7 @@ def _build_step_function(
                 f'    hook = PostgresHook(postgres_conn_id="edupulse")\n'
                 f"    conn = hook.get_conn()\n"
                 f"    cursor = conn.cursor()\n"
+                f"{source_check}"
                 f"    cursor.execute({safe_query})\n"
                 f"    rows = cursor.fetchall()\n"
                 f"    rowcount = len(rows)\n"
@@ -76,6 +87,7 @@ def _build_step_function(
                 f'    hook = PostgresHook(postgres_conn_id="edupulse")\n'
                 f"    conn = hook.get_conn()\n"
                 f"    cursor = conn.cursor()\n"
+                f"{source_check}"
                 f"{replace_dest}"
                 f"    cursor.execute({safe_query})\n"
                 f"    rowcount = cursor.rowcount\n"
@@ -99,6 +111,7 @@ def _build_step_function(
             )
             if source_table:
                 body += f'    df = pd.read_sql("SELECT * FROM {source_table}", engine)\n'
+                body += f'    if df.empty: raise ValueError("Source table {source_table} is empty")\n'
             body += (
                 f"    _rows_in = len(df) if 'df' in dir() else 0\n"
                 f"    # --- user transformation ---\n"

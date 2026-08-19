@@ -1,4 +1,6 @@
-from pydantic import BaseModel
+from typing import Literal
+
+from pydantic import BaseModel, Field
 
 
 # Superset
@@ -27,27 +29,31 @@ class DAGStatusResponse(BaseModel):
 
 # AI Analytics
 class AnalyzeRequest(BaseModel):
-    dashboard_title: str
-    dashboard_description: str
-    dashboard_uuid: str = ""
+    dashboard_title: str = Field(min_length=1, max_length=200)
+    dashboard_description: str = Field(default="", max_length=2000)
+    dashboard_uuid: str = Field(default="", max_length=100)
 
 
 class AnalyzeResponse(BaseModel):
     dashboard_type: str
     summary: str
     key_findings: list[str]
-    trend: str
+    trend: Literal["increasing", "decreasing", "stable", "insufficient_data"]
     business_recommendation: str
     potential_issue: str | None
-    confidence: float
+    confidence: float = Field(ge=0.0, le=1.0)
+
+
+class AIAnalysisResult(AnalyzeResponse):
+    """Validated contract returned by the analysis model."""
 
 
 # AI Chat
 class ChatRequest(BaseModel):
-    message: str
-    dashboard_uuid: str
-    session_id: str
-    dashboard_title: str = ""
+    message: str = Field(min_length=1, max_length=4000)
+    dashboard_uuid: str = Field(default="", max_length=100)
+    session_id: str = Field(min_length=1, max_length=100)
+    dashboard_title: str = Field(default="", max_length=200)
 
 
 class ChatResponse(BaseModel):
@@ -56,7 +62,7 @@ class ChatResponse(BaseModel):
 
 
 class ChatClearRequest(BaseModel):
-    session_id: str
+    session_id: str = Field(min_length=1, max_length=100)
 
 
 # Dashboards

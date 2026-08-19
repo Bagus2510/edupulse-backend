@@ -1,4 +1,7 @@
-from fastapi import FastAPI
+import logging
+import time
+
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi.errors import RateLimitExceeded
 from fastapi.responses import JSONResponse
@@ -7,6 +10,7 @@ from sqlalchemy import text
 from app.core.config import settings
 from app.core.database import check_db_connection, async_session
 from app.core.pg_pool import close_pools
+from app.core.http_client import close_http_client
 from app.core.rate_limit import limiter
 from app.routers import superset, airflow, ai, settings as settings_router, dashboards, activity, pipeline, auth, pipelines, home, datasets, lineage, domains, metadata, admin_users, quality_rules
 from app.services.data_quality import backfill_asset_metadata
@@ -18,6 +22,17 @@ app = FastAPI(
 )
 
 app.state.limiter = limiter
+logger = logging.getLogger("edupulse.request")
+
+
+@app.middleware("http")
+async def request_metrics(request: Request, call_next):
+    started = time.perf_counter()
+    response = await call_next(request)
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    response.headers["X-Request-Duration-Ms"] = f"{elapsed_ms:.1f}"
+    logger.info("%s %s -> %s (%.1f ms)", request.method, request.url.path, response.status_code, elapsed_ms)
+    return response
 
 
 @app.exception_handler(RateLimitExceeded)
@@ -205,6 +220,7 @@ async def ensure_schemas():
 @app.on_event("shutdown")
 async def shutdown_resources():
     await close_pools()
+    await close_http_client()
 
 
 @app.get("/api/health")
