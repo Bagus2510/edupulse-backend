@@ -121,7 +121,9 @@ backend/
 │
 ├── app/
 │   ├── core/
-│   │   ├── database.py           # DB connection & session
+│   │   ├── database.py           # SQLAlchemy engine & session
+│   │   ├── pg_pool.py            # Shared asyncpg pools
+│   │   ├── http_client.py        # Shared Airflow HTTP client + timeout
 │   │   └── security.py           # JWT, RBAC, password hashing
 │   │
 │   ├── models/
@@ -219,11 +221,13 @@ backend/
 ### AI Analytics
 | Method | Endpoint | Auth | Description |
 |--------|----------|------|-------------|
-| GET | `/api/ai/sessions` | Editor+ | List chat sessions |
-| POST | `/api/ai/chat` | Editor+ | Chat (non-streaming) |
-| POST | `/api/ai/chat/stream` | Editor+ | Chat (streaming SSE) |
-| GET | `/api/ai/sessions/{id}/history` | Editor+ | Get session history |
-| DELETE | `/api/ai/sessions/{id}` | Editor+ | Delete session |
+| POST | `/api/ai/analyze` | Viewer+ | Structured dashboard analysis |
+| GET | `/api/ai/chat/sessions` | Viewer+ | List owned chat sessions |
+| POST | `/api/ai/chat` | Viewer+ | Chat (non-streaming) |
+| POST | `/api/ai/chat/stream` | Viewer+ | Chat dengan SSE evidence |
+| GET | `/api/ai/chat/history/{session_id}` | Viewer+ | Get owned session history |
+| POST | `/api/ai/chat/clear` | Viewer+ | Clear owned session messages |
+| DELETE | `/api/ai/chat/sessions/{session_id}` | Viewer+ | Delete owned session |
 
 ### Admin
 | Method | Endpoint | Auth | Description |
@@ -328,14 +332,37 @@ async def delete_pipeline(current_user: AdminUserDep):
 
 ---
 
+## 🛡️ Reliability & AI Safeguards
+
+- Chat session selalu difilter `user_id`; caller tidak dapat membaca/menghapus session user lain.
+- Pipeline run memakai row lock `FOR UPDATE`; endpoint read/status/history membutuhkan viewer auth.
+- Upload dataset memakai PostgreSQL `COPY`; chart identifier divalidasi sebelum dynamic SQL.
+- Shared asyncpg pools ditutup saat shutdown; SQLAlchemy memakai `pool_pre_ping`, recycle, dan command timeout.
+- Airflow HTTP client memakai connect/read timeout dan connection limits; Superset login memakai client terisolasi agar cookie tidak bocor antar-request.
+- Request log mencatat method, path, status, latency dan response header `X-Request-Duration-Ms`.
+- AI request memiliki batas panjang; structured analysis divalidasi Pydantic dengan confidence `0.0–1.0`.
+- Dashboard data dibatasi, diringkas, dan dibungkus `<untrusted_dashboard_data>` agar isi chart tidak dianggap instruksi.
+- Log AI hanya menyimpan model, identifier, latency, ukuran input/output, dan usage metadata—bukan prompt, chart data, API key, atau secret.
+
+## 🧪 Tests
+
+```bash
+python -m py_compile app/models/schemas.py app/services/gemini_client.py app/services/ai_chat.py app/routers/ai.py
+python -m unittest discover -s tests -v
+```
+
+Regression suite mencakup SQL single-statement, generated DAG quality gate/idempotency, bounded AI input, confidence validation, Decimal summary, empty evidence, chart-name replacement, dan prompt-injection delimiter. Test tidak memanggil Gemini network.
+
+## 🗃️ Database Migration
+
+Implementasi saat ini tidak menambah atau mengubah tabel, kolom, index, constraint, maupun enum PostgreSQL. Alembic migration tidak diperlukan selama schema existing sudah memiliki `app.chat_sessions.user_id` dan `app.chat_messages.evidence`.
+
 ## 🔮 Future Improvements
 
-- [ ] Add rate limiting per endpoint
-- [ ] Implement WebSocket for real-time pipeline status
-- [ ] Add OpenAPI schema documentation
-- [ ] Implement caching layer (Redis)
-- [ ] Add comprehensive unit tests
-- [ ] Implement audit logging for all mutations
+- [ ] Persist aggregate token/cost metrics tanpa prompt contents
+- [ ] Tambah adversarial AI evaluation dan model rollout gates
+- [ ] Implement WebSocket bila polling status pipeline tidak lagi mencukupi
+- [ ] Tambah Redis hanya jika profiling menunjukkan cache process-local tidak cukup
 
 ---
 
