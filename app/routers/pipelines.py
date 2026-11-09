@@ -1,3 +1,4 @@
+import json
 import logging
 from typing import Annotated
 
@@ -17,7 +18,7 @@ from app.models.schemas import (
     ColumnInfo,
 )
 from app.services.dag_generator import generate_dag_id, generate_dag_content, save_dag_file, delete_dag_file
-from app.services.airflow_client import trigger_dag, get_dag_status, cancel_dag_run
+from app.services.airflow_client import trigger_dag, get_dag_status, cancel_dag_run, set_dag_paused
 from app.services.pipeline_validator import validate_step
 from app.services.cron_parser import cron_to_human, next_run_time
 from app.services.mart_metadata import register_all_mart_tables
@@ -25,6 +26,15 @@ from app.services.mart_metadata import register_all_mart_tables
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/pipelines", tags=["pipelines"])
+
+
+async def _record_pipeline_quality(db: AsyncSession, pipeline_id: int, pipeline_run_pk: int) -> dict:
+    summary = await register_all_mart_tables(db, pipeline_id)
+    await db.execute(
+        text("UPDATE app.pipeline_runs SET quality_status = :status, quality_summary = CAST(:summary AS JSONB) WHERE id = :id"),
+        {"status": summary["status"], "summary": json.dumps(summary), "id": pipeline_run_pk},
+    )
+    return summary
 
 
 @router.get("", response_model=list[PipelineListResponse])
@@ -46,24 +56,38 @@ async def list_pipelines(
     rows = result.fetchall()
 
     for r in rows:
-        if r.status == "running" and r.dag_id:
+        if r.status in ("running", "queued") and r.dag_id:
             try:
-                airflow_result = await get_dag_status(r.dag_id)
+                active_run = await db.execute(
+                    text("SELECT id, run_id FROM app.pipeline_runs WHERE dag_id = :d AND status IN ('running', 'queued') ORDER BY created_at DESC LIMIT 1"),
+                    {"d": r.dag_id},
+                )
+                active_run_row = active_run.fetchone()
+                airflow_result = (
+                    await get_dag_status(r.dag_id, run_id=active_run_row.run_id)
+                    if active_run_row and active_run_row.run_id
+                    else {}
+                )
                 airflow_state = airflow_result.get("state")
-                if airflow_state and airflow_state in ("success", "failed", "queued"):
-                    await db.execute(
-                        text("UPDATE app.pipeline_runs SET status = :s WHERE dag_id = :d AND status = 'running'"),
-                        {"s": airflow_state, "d": r.dag_id},
-                    )
+                if airflow_state and airflow_state in ("running", "success", "failed", "queued"):
+                    active_run_pk = active_run_row.id if active_run_row else None
+                    if active_run_pk:
+                        await db.execute(
+                            text("UPDATE app.pipeline_runs SET status = :s WHERE id = :id"),
+                            {"s": airflow_state, "id": active_run_pk},
+                        )
                     await db.execute(
                         text("UPDATE app.pipelines SET status = :s WHERE id = :id"),
                         {"s": airflow_state, "id": r.id},
                     )
                     if airflow_state == "success":
-                        await register_all_mart_tables(db, r.id)
+                        if active_run_pk:
+                            await _record_pipeline_quality(db, r.id, active_run_pk)
+                        else:
+                            await register_all_mart_tables(db, r.id)
                     r.status = airflow_state
             except Exception:
-                pass
+                logger.exception("Failed to synchronize pipeline %s with Airflow", r.id)
 
     await db.commit()
 
@@ -209,13 +233,14 @@ async def update_pipeline(
         if err:
             raise HTTPException(status_code=400, detail=f"Step {i} ({step.name}): {err}")
 
-    existing = await db.execute(text("SELECT id, dag_id, name FROM app.pipelines WHERE id = :id"), {"id": pipeline_id})
+    existing = await db.execute(text("SELECT id, dag_id, name, is_active FROM app.pipelines WHERE id = :id"), {"id": pipeline_id})
     row = existing.fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Pipeline tidak ditemukan")
 
     old_dag_id = row.dag_id
     old_name = row.name
+    is_active = bool(row.is_active)
 
     # Only regenerate dag_id if pipeline name actually changed
     if old_name != payload.name:
@@ -252,6 +277,7 @@ async def update_pipeline(
         schedule_interval=payload.schedule_interval,
         max_active_runs=payload.max_active_runs,
         on_failure_callback=payload.on_failure_callback,
+        is_active=is_active,
     )
     save_dag_file(new_dag_id, content)
 
@@ -298,8 +324,8 @@ async def run_pipeline(
         raise HTTPException(status_code=404, detail="Pipeline tidak ditemukan")
     pipeline = await _get_pipeline_raw(pipeline_id, db)
 
-    if pipeline.get("status") == "running":
-        raise HTTPException(status_code=409, detail="Pipeline sedang berjalan. Tunggu hingga selesai.")
+    if pipeline.get("status") in ("running", "queued"):
+        raise HTTPException(status_code=409, detail="Pipeline sedang berjalan atau menunggu. Tunggu hingga selesai.")
 
     dag_id = pipeline.get("dag_id")
     if not dag_id:
@@ -326,13 +352,15 @@ async def run_pipeline(
         schedule_interval=pipeline.get("schedule_interval", ""),
         max_active_runs=pipeline.get("max_active_runs", 1),
         on_failure_callback=pipeline.get("on_failure_callback", ""),
+        is_active=bool(pipeline.get("is_active", True)),
     )
     save_dag_file(dag_id, content)
 
-    await db.execute(
-        text("INSERT INTO app.pipeline_runs (dag_id, status, tasks_total, triggered_by) VALUES (:d, 'running', :t, :u)"),
+    run_result = await db.execute(
+        text("INSERT INTO app.pipeline_runs (dag_id, status, tasks_total, triggered_by) VALUES (:d, 'running', :t, :u) RETURNING id"),
         {"d": dag_id, "t": len(steps), "u": current_user["id"]},
     )
+    pipeline_run_pk = run_result.scalar_one()
     await db.execute(
         text("UPDATE app.pipelines SET status = 'running', last_run_at = NOW() WHERE id = :id"),
         {"id": pipeline_id},
@@ -344,18 +372,18 @@ async def run_pipeline(
     await db.commit()
 
     try:
-        airflow_result = await trigger_dag(dag_id)
+        airflow_result = await trigger_dag(dag_id, ensure_unpaused=bool(pipeline.get("is_active", True)))
         await db.execute(
-            text("UPDATE app.pipeline_runs SET run_id = :r, status = :s WHERE dag_id = :d AND status = 'running'"),
-            {"r": airflow_result["run_id"], "s": "running", "d": dag_id},
+            text("UPDATE app.pipeline_runs SET run_id = :r, status = :s WHERE id = :id"),
+            {"r": airflow_result["run_id"], "s": "running", "id": pipeline_run_pk},
         )
         await db.commit()
     except Exception as e:
         logger.error("Airflow trigger failed for %s: %s", dag_id, e, exc_info=True)
         try:
             await db.execute(
-                text("UPDATE app.pipeline_runs SET status = 'failed' WHERE dag_id = :d AND status = 'running'"),
-                {"d": dag_id},
+                text("UPDATE app.pipeline_runs SET status = 'failed' WHERE id = :id"),
+                {"id": pipeline_run_pk},
             )
             await db.execute(
                 text("UPDATE app.pipelines SET status = 'failed' WHERE id = :id"),
@@ -379,8 +407,8 @@ async def cancel_pipeline(
     if not pipeline:
         raise HTTPException(status_code=404, detail="Pipeline tidak ditemukan")
 
-    if pipeline.get("status") != "running":
-        raise HTTPException(status_code=409, detail="Pipeline tidak sedang berjalan")
+    if pipeline.get("status") not in ("running", "queued"):
+        raise HTTPException(status_code=409, detail="Pipeline tidak sedang berjalan atau menunggu")
 
     dag_id = pipeline.get("dag_id")
     if not dag_id:
@@ -388,7 +416,7 @@ async def cancel_pipeline(
 
     # Get latest run_id
     runs_result = await db.execute(
-        text("SELECT run_id FROM app.pipeline_runs WHERE dag_id = :d AND status = 'running' ORDER BY created_at DESC LIMIT 1"),
+        text("SELECT run_id FROM app.pipeline_runs WHERE dag_id = :d AND status IN ('running', 'queued') ORDER BY created_at DESC LIMIT 1"),
         {"d": dag_id},
     )
     row = runs_result.first()
@@ -404,8 +432,8 @@ async def cancel_pipeline(
         raise HTTPException(status_code=502, detail="Gagal cancel pipeline di Airflow")
 
     await db.execute(
-        text("UPDATE app.pipeline_runs SET status = 'failed' WHERE dag_id = :d AND status = 'running'"),
-        {"d": dag_id},
+        text("UPDATE app.pipeline_runs SET status = 'failed' WHERE dag_id = :d AND run_id = :run_id"),
+        {"d": dag_id, "run_id": run_id},
     )
     await db.execute(
         text("UPDATE app.pipelines SET status = 'failed' WHERE id = :id"),
@@ -443,26 +471,36 @@ async def pipeline_status(
         return {"pipeline_id": pipeline_id, "status": "idle", "dag_id": dag_id}
 
     airflow_state = None
+    quality_status = getattr(run, "quality_status", None)
+    quality_summary = getattr(run, "quality_summary", None)
     tasks_completed = run.tasks_completed or 0
     tasks_total = run.tasks_total or 0
     try:
-        airflow_result = await get_dag_status(dag_id)
+        airflow_result = (
+            await get_dag_status(dag_id, run_id=run.run_id)
+            if run.run_id
+            else {}
+        )
         airflow_state = airflow_result.get("state")
         tasks_completed = airflow_result.get("tasks_completed", tasks_completed)
         tasks_total = airflow_result.get("tasks_total", tasks_total)
 
-        if airflow_state and airflow_state in ("success", "failed", "queued"):
+        if airflow_state and airflow_state in ("running", "success", "failed", "queued"):
             await db.execute(
-                text("UPDATE app.pipeline_runs SET status = :s, tasks_completed = :tc WHERE dag_id = :d AND status = 'running'"),
-                {"s": airflow_state, "tc": tasks_completed, "d": dag_id},
+                text("UPDATE app.pipeline_runs SET status = :s, tasks_completed = :tc WHERE id = :id"),
+                {"s": airflow_state, "tc": tasks_completed, "id": run.id},
             )
             await db.execute(
                 text("UPDATE app.pipelines SET status = :s WHERE id = :id"),
                 {"s": airflow_state, "id": pipeline_id},
             )
+            if airflow_state == "success" and run.status in ("running", "queued"):
+                quality_summary = await _record_pipeline_quality(db, pipeline_id, run.id)
+                quality_status = quality_summary["status"]
             await db.commit()
     except Exception:
-        pass
+        await db.rollback()
+        logger.exception("Failed to synchronize pipeline %s with Airflow", pipeline_id)
 
     return {
         "pipeline_id": pipeline_id,
@@ -474,8 +512,8 @@ async def pipeline_status(
         "rows_read": getattr(run, "rows_read", None),
         "rows_written": getattr(run, "rows_written", None),
         "duration_ms": getattr(run, "duration_ms", None),
-        "quality_status": getattr(run, "quality_status", None),
-        "quality_summary": getattr(run, "quality_summary", None),
+        "quality_status": quality_status,
+        "quality_summary": quality_summary,
         "error_message": getattr(run, "error_message", None),
         "created_at": str(run.created_at),
     }
@@ -528,14 +566,31 @@ async def toggle_pipeline_active(
     db: AsyncSession = Depends(get_db),
 ):
     result = await db.execute(
-        text("UPDATE app.pipelines SET is_active = NOT is_active, updated_at = NOW() WHERE id = :id RETURNING id, is_active"),
+        text("SELECT id, dag_id, is_active FROM app.pipelines WHERE id = :id FOR UPDATE"),
         {"id": pipeline_id},
     )
     row = result.fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Pipeline tidak ditemukan")
+    if not row.dag_id:
+        raise HTTPException(status_code=409, detail="Pipeline belum memiliki DAG Airflow")
+
+    is_active = not bool(row.is_active)
+    try:
+        await set_dag_paused(row.dag_id, is_paused=not is_active)
+    except Exception as e:
+        logger.error("Airflow pause update failed for %s: %s", row.dag_id, e, exc_info=True)
+        raise HTTPException(status_code=502, detail="Gagal mengubah status jadwal di Airflow")
+
+    await db.execute(
+        text("UPDATE app.pipelines SET is_active = :active, updated_at = NOW() WHERE id = :id"),
+        {"active": is_active, "id": pipeline_id},
+    )
     await db.commit()
-    return {"message": f"Pipeline {'diaktifkan' if row.is_active else 'dinonaktifkan'}", "is_active": row.is_active}
+    return {
+        "message": f"Jadwal pipeline {'diaktifkan' if is_active else 'dinonaktifkan'}",
+        "is_active": is_active,
+    }
 
 
 @router.get("/{pipeline_id}/consumers")

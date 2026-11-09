@@ -28,6 +28,19 @@ class P1RegressionTests(unittest.TestCase):
         self.assertIn("SELECT COUNT(*) FROM raw.source", content)
         self.assertIn("DROP TABLE IF EXISTS mart.output", content)
         self.assertIn("CREATE TABLE mart.output AS", content)
+        self.assertIn("is_paused_upon_creation=False", content)
+        self.assertNotIn("quality_status = 'passed'", content)
+        compile(content, "generated_dag.py", "exec")
+
+    def test_generated_dag_starts_paused_when_inactive(self):
+        content = generate_dag_content(
+            "paused_test",
+            "Paused Test",
+            [{"name": "Build mart", "query_type": "sql", "query": "SELECT 1"}],
+            is_active=False,
+        )
+        self.assertIn("is_paused_upon_creation=True", content)
+        compile(content, "generated_dag.py", "exec")
 
 
 if __name__ == "__main__":

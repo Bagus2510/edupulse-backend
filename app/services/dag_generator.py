@@ -146,7 +146,15 @@ def _build_step_function(
     return body
 
 
-def generate_dag_content(dag_id: str, pipeline_name: str, steps: list[dict], schedule_interval: str = "", max_active_runs: int = 1, on_failure_callback: str = "") -> str:
+def generate_dag_content(
+    dag_id: str,
+    pipeline_name: str,
+    steps: list[dict],
+    schedule_interval: str = "",
+    max_active_runs: int = 1,
+    on_failure_callback: str = "",
+    is_active: bool = True,
+) -> str:
     """Generate DAG file content with full instrumentation. Returns the Python source code."""
     safe_name = "".join(c if c.isalnum() else "_" for c in pipeline_name)
 
@@ -203,7 +211,8 @@ def generate_dag_content(dag_id: str, pipeline_name: str, steps: list[dict], sch
         f"        conn = hook.get_conn()\n"
         f"        cursor = conn.cursor()\n"
         f"        dag_id = context['dag'].dag_id\n"
-        f"        run_id = context['run'].run_id\n"
+        f"        dag_run = context.get('dag_run')\n"
+        f"        run_id = context.get('run_id') or getattr(dag_run, 'run_id', None)\n"
         f"        total_rows_read = 0\n"
         f"        total_rows_written = 0\n"
         f"        total_duration_ms = 0\n"
@@ -222,8 +231,8 @@ def generate_dag_content(dag_id: str, pipeline_name: str, steps: list[dict], sch
         f"            except Exception:\n"
         f"                pass\n"
         f"        cursor.execute(\n"
-        f'            "UPDATE app.pipeline_runs SET rows_read = %s, rows_written = %s, duration_ms = %s, quality_status = \'passed\' WHERE id = (SELECT id FROM app.pipeline_runs WHERE dag_id = %s AND status = \'running\' ORDER BY id DESC LIMIT 1)",\n'
-        f"            (total_rows_read, total_rows_written, total_duration_ms, dag_id)\n"
+        f'            "UPDATE app.pipeline_runs SET rows_read = %s, rows_written = %s, duration_ms = %s WHERE dag_id = %s AND run_id = %s",\n'
+        f"            (total_rows_read, total_rows_written, total_duration_ms, dag_id, run_id)\n"
         f"        )\n"
         f"        conn.commit()\n"
         f"        cursor.close()\n"
@@ -243,12 +252,14 @@ def generate_dag_content(dag_id: str, pipeline_name: str, steps: list[dict], sch
         f"        conn = hook.get_conn()\n"
         f"        cursor = conn.cursor()\n"
         f"        dag_id = context['dag'].dag_id\n"
+        f"        dag_run = context.get('dag_run')\n"
+        f"        run_id = context.get('run_id') or getattr(dag_run, 'run_id', None)\n"
         f"        error_msg = str(context.get('exception', ''))\n"
         f"        tb = traceback.format_exception(type(context.get('exception', Exception())), context.get('exception', Exception()), context.get('exception', None).__traceback__ if hasattr(context.get('exception', Exception()), '__traceback__') else None)\n"
         f"        full_error = error_msg + '\\n' + ''.join(tb) if tb else error_msg\n"
         f"        cursor.execute(\n"
-        f'            "UPDATE app.pipeline_runs SET status = \'failed\', error_message = %s WHERE id = (SELECT id FROM app.pipeline_runs WHERE dag_id = %s AND status = \'running\' ORDER BY id DESC LIMIT 1)",\n'
-        f"            (full_error[:2000], dag_id)\n"
+        f'            "UPDATE app.pipeline_runs SET status = \'failed\', error_message = %s WHERE dag_id = %s AND run_id = %s",\n'
+        f"            (full_error[:2000], dag_id, run_id)\n"
         f"        )\n"
         f"        conn.commit()\n"
         f"        cursor.close()\n"
@@ -286,6 +297,7 @@ def generate_dag_content(dag_id: str, pipeline_name: str, steps: list[dict], sch
         f"    start_date=datetime(2026, 1, 1),\n"
         f"    catchup=False,\n"
         f"    max_active_runs={max_active_runs},\n"
+        f"    is_paused_upon_creation={not is_active},\n"
         f'    tags=["edupulse", "auto-generated"],\n'
         f") as dag:\n"
         f"{tasks_block}\n\n"

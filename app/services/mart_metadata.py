@@ -14,7 +14,7 @@ async def upsert_mart_metadata(
     dest_table: str,
     pipeline_id: int | None = None,
     step_id: int | None = None,
-):
+) -> dict | None:
     """Register or update a mart table in metadata after pipeline step completes."""
     if not dest_table or not dest_table.startswith("mart."):
         return
@@ -82,20 +82,41 @@ async def upsert_mart_metadata(
     await db.commit()
     try:
         asset_id = await sync_asset_metadata(db, schema_name, table_name, "mart")
-        await run_quality_checks(db, schema_name, table_name, asset_id=asset_id)
+        return await run_quality_checks(db, schema_name, table_name, asset_id=asset_id)
     except SQLAlchemyError:
         # Metadata registration must not make a successful pipeline fail.
         await db.rollback()
+        return None
 
 
-async def register_all_mart_tables(db: AsyncSession, pipeline_id: int):
-    """Register all mart dest_tables from a pipeline's steps."""
+async def register_all_mart_tables(db: AsyncSession, pipeline_id: int) -> dict:
+    """Register mart outputs and return their aggregated quality status."""
     result = await db.execute(
         text("SELECT id, dest_table FROM app.pipeline_steps WHERE pipeline_id = :pid AND dest_table LIKE 'mart.%'"),
         {"pid": pipeline_id},
     )
-    for row in result.fetchall():
-        await upsert_mart_metadata(db, row.dest_table, pipeline_id=pipeline_id, step_id=row.id)
+    destinations = result.fetchall()
+    assets = []
+    for row in destinations:
+        quality = await upsert_mart_metadata(db, row.dest_table, pipeline_id=pipeline_id, step_id=row.id)
+        if quality:
+            assets.append({
+                "table": row.dest_table,
+                "status": quality["quality_status"],
+                "score": quality["quality_score"],
+            })
+
+    statuses = [asset["status"] for asset in assets]
+    if "failed" in statuses:
+        overall_status = "failed"
+    elif "warning" in statuses:
+        overall_status = "warning"
+    elif destinations and len(assets) == len(destinations) and statuses and all(status == "passed" for status in statuses):
+        overall_status = "passed"
+    else:
+        overall_status = "unknown"
+
+    return {"status": overall_status, "assets": assets}
 
 
 def compute_freshness(last_built_at: datetime | None) -> str:
